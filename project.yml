@@ -1,0 +1,112 @@
+# XcodeGen spec for Texel on iPhone/iPad (TexelPhone) and Mac (TexelMac), sharing the same code.
+# build-ipa.sh and build-mac.sh turn this into TexelPhone.xcodeproj.
+name: TexelPhone
+options:
+  bundleIdPrefix: app.texel
+  deploymentTarget:
+    iOS: "17.0"
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    # Both platforms share one version so they ship as one App Store release.
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  TexelPhone:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes:
+          - Info.plist
+      - path: Shared/Core.swift
+      - path: Shared/Engine.swift
+      - path: Shared/Shaders.swift
+      - path: Shared/ImageFiles.swift
+      - path: Shared/AIUpscaler.swift
+      # The AI models ship as-is and are prepared on the phone the first time they're used.
+      - path: Models/TexelAI-Photo.mlpackage
+        type: folder
+        buildPhase: resources
+      - path: Models/TexelAI-General.mlpackage
+        type: folder
+        buildPhase: resources
+      - path: Models/TexelAI-Anime.mlpackage
+        type: folder
+        buildPhase: resources
+      - path: Models/LICENSE-Real-ESRGAN.txt
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: Texel
+        PRODUCT_BUNDLE_IDENTIFIER: com.Mspra.texel
+        DEVELOPMENT_TEAM: YWGQ662D6B
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_BITCODE: NO
+        SWIFT_STRICT_CONCURRENCY: minimal
+  TexelMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+        excludes:
+          - Info.plist
+      - path: Shared/Core.swift
+      - path: Shared/Engine.swift
+      - path: Shared/Shaders.swift
+      - path: Shared/ImageFiles.swift
+      - path: Shared/AIUpscaler.swift
+      - path: Models/TexelAI-Photo.mlpackage
+        type: folder
+        buildPhase: resources
+      - path: Models/TexelAI-General.mlpackage
+        type: folder
+        buildPhase: resources
+      - path: Models/TexelAI-Anime.mlpackage
+        type: folder
+        buildPhase: resources
+      - path: Models/LICENSE-Real-ESRGAN.txt
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: Texel
+        PRODUCT_BUNDLE_IDENTIFIER: com.Mspra.texel
+        INFOPLIST_FILE: Mac/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIconMac
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        # Same bundle ID as the iPhone app: one App Store listing for both (Universal Purchase).
+        # Signed with your team; build-mac.sh overrides this to sign for this Mac only.
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: YWGQ662D6B
+        CODE_SIGN_ENTITLEMENTS: Mac/Texel.entitlements
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_APP_SANDBOX: YES
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.photography
+        COMBINE_HIDPI_IMAGES: YES
+        SWIFT_STRICT_CONCURRENCY: minimal
+schemes:
+  TexelMac:
+    build:
+      targets:
+        TexelMac: all
+    run:
+      config: Release
+    archive:
+      config: Release
+  TexelPhone:
+    build:
+      targets:
+        TexelPhone: all
+    # Run optimised builds on the phone: the AI tiling is far slower in Debug.
+    run:
+      config: Release
+    archive:
+      config: Release

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required for the Mac App Store. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <!-- Open images you pick or drop, and save where you choose. -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <!-- Start the Save dialog in Downloads. -->
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+    <!-- "Add to Photos Library". -->
+    <key>com.apple.security.personal-information.photos-library</key>
+    <true/>
+</dict>
+</plist>

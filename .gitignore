@@ -1,0 +1,20 @@
+# Build output and local copies
+build/
+AppStore/
+Texel.app
+*.ipa
+*.pkg
+*.xcarchive
+DerivedData/
+
+# Generated: build-mac.sh / build-ipa.sh recreate it from project.yml
+TexelPhone.xcodeproj/
+
+# Tools and scratch
+.tools/
+.pending/
+
+# macOS / Xcode clutter
+.DS_Store
+xcuserdata/
+*.xcuserstate

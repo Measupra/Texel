@@ -52,6 +52,12 @@ fi
 rm -rf Texel.app
 cp -R "$APP" Texel.app
 
+# A zip for sharing (e.g. a GitHub release). ditto keeps the permissions and signature intact;
+# zips made other ways can drop the "executable" flag, and then the app won't open on other Macs.
+rm -f Texel.zip
+ditto -c -k --sequesterRsrc --keepParent Texel.app Texel.zip
+
 echo ""
 echo "Done: $(pwd)/Texel.app"
 echo "Open it with:  open Texel.app   or drag it into /Applications."
+echo "To share it, upload Texel.zip (not a zip you make yourself)."

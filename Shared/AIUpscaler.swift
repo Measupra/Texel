@@ -62,25 +62,26 @@ final class AIUpscaler: @unchecked Sendable {
     static let maxOutputPixels = 268_000_000
     #endif
 
-    private var cache: [AIModel: MLModel] = [:]
+    private var cache: [String: MLModel] = [:]
     private let lock = NSLock()
 
     private enum Location { case compiled(URL), package(URL) }
 
-    func isAvailable(_ m: AIModel) -> Bool { location(m) != nil }
+    func isAvailable(_ m: AIModel) -> Bool { location(m.rawValue) != nil }
+    func isAvailable(named name: String) -> Bool { location(name) != nil }
 
-    private func location(_ m: AIModel) -> Location? {
+    private func location(_ name: String) -> Location? {
         let b = Bundle.main
-        if let u = b.url(forResource: m.rawValue, withExtension: "mlmodelc") { return .compiled(u) }
-        if let u = b.url(forResource: m.rawValue, withExtension: "mlpackage") { return .package(u) }
-        if let u = b.url(forResource: m.rawValue, withExtension: "mlpackage", subdirectory: "Models") { return .package(u) }
+        if let u = b.url(forResource: name, withExtension: "mlmodelc") { return .compiled(u) }
+        if let u = b.url(forResource: name, withExtension: "mlpackage") { return .package(u) }
+        if let u = b.url(forResource: name, withExtension: "mlpackage", subdirectory: "Models") { return .package(u) }
         #if os(macOS)
         // Beside the executable or in ./Models, for runs outside the .app bundle.
         let fm = FileManager.default
         let exeDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
         let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
         for dir in [exeDir, cwd.appendingPathComponent("Models")] {
-            let u = dir.appendingPathComponent(m.rawValue + ".mlpackage")
+            let u = dir.appendingPathComponent(name + ".mlpackage")
             if fm.fileExists(atPath: u.path) { return .package(u) }
         }
         #endif
@@ -89,11 +90,16 @@ final class AIUpscaler: @unchecked Sendable {
 
     /// Loads the model, compiling it once (cached in Application Support) if it ships uncompiled.
     private func load(_ m: AIModel, status: (String) -> Void) throws -> MLModel {
+        try loadModel(named: m.rawValue, status: status)
+    }
+
+    /// Loads any bundled model by name (the upscalers, or the face restorer).
+    func loadModel(named name: String, status: (String) -> Void) throws -> MLModel {
         lock.lock()
-        if let cached = cache[m] { lock.unlock(); return cached }
+        if let cached = cache[name] { lock.unlock(); return cached }
         lock.unlock()
 
-        guard let loc = location(m) else { throw AIError.missing(m.rawValue) }
+        guard let loc = location(name) else { throw AIError.missing(name) }
         let compiledURL: URL
         switch loc {
         case .compiled(let u):
@@ -115,7 +121,7 @@ final class AIUpscaler: @unchecked Sendable {
                 hash = (hash ^ UInt64(byte)) &* 0x100000001b3
             }
             let stamp = "\(String(hash, radix: 16))-\(size)"
-            let target = support.appendingPathComponent("\(m.rawValue)-\(stamp).mlmodelc")
+            let target = support.appendingPathComponent("\(name)-\(stamp).mlmodelc")
             if !fm.fileExists(atPath: target.path) {
                 status("Preparing the AI model (first use only)…")
                 let tmp = try MLModel.compileModel(at: src)
@@ -129,7 +135,7 @@ final class AIUpscaler: @unchecked Sendable {
         cfg.computeUnits = .all
         let model = try MLModel(contentsOf: compiledURL, configuration: cfg)
         lock.lock()
-        cache[m] = model
+        cache[name] = model
         lock.unlock()
         return model
     }
@@ -178,9 +184,13 @@ final class AIUpscaler: @unchecked Sendable {
 
     // MARK: low-resolution detection
 
-    /// How many times smaller the image's real detail is than its pixel size (1 = a normal photo).
-    /// Shrinks a centre crop by each candidate factor, enlarges it back, and checks how closely the
-    /// result matches. An image that was enlarged before matches almost exactly at its true factor.
+    /// How many times a pixelated image was blown up (1 = a normal image, leave it alone).
+    ///
+    /// Only blocky enlargements count: there, every change between neighbouring pixels sits on a
+    /// regular grid, one column (and row) in every f. Smooth images, renders and photos — even soft
+    /// or smoothly enlarged ones — have no such grid and are never shrunk, because shrinking them
+    /// throws away real detail. The old test averaged a reconstruction error over the whole image,
+    /// which large smooth areas (skies, studio backdrops) could pass on their own.
     static func effectiveDownscale(_ rgba: [UInt8], width W: Int, height H: Int) -> Int {
         let align = 48
         let cw = min(W, 1536) / align * align, ch = min(H, 1536) / align * align
@@ -193,11 +203,39 @@ final class AIUpscaler: @unchecked Sendable {
                 Y[y * cw + x] = (Float(rgba[i]) * 77 + Float(rgba[i + 1]) * 150 + Float(rgba[i + 2]) * 29) / 256
             }
         }
+        // Mean change between neighbouring pixels, per column and per row.
+        var colDiff = [Float](repeating: 0, count: cw - 1)
+        var rowDiff = [Float](repeating: 0, count: ch - 1)
+        for y in 0..<ch {
+            let r = y * cw
+            for x in 0..<(cw - 1) { colDiff[x] += abs(Y[r + x + 1] - Y[r + x]) }
+            if y < ch - 1 {
+                var acc: Float = 0
+                for x in 0..<cw { acc += abs(Y[r + cw + x] - Y[r + x]) }
+                rowDiff[y] = acc
+            }
+        }
         var best = 1
         for f in [2, 3, 4, 6, 8, 12, 16] where cw / f >= 24 && ch / f >= 24 {
-            if reconstructionError(Y, cw, ch, f) < 1.0 { best = f }
+            if gridRatio(colDiff, f) < 0.5 && gridRatio(rowDiff, f) < 0.5
+                && reconstructionError(Y, cw, ch, f) < 3.0 {
+                best = f
+            }
         }
         return best
+    }
+
+    /// Folds per-position changes onto a grid of period f. Returns the strongest off-grid phase
+    /// relative to the on-grid one: near 0 for blocky images, near 1 for everything else.
+    private static func gridRatio(_ d: [Float], _ f: Int) -> Float {
+        let n = d.count / f * f
+        guard n >= f else { return 1 }
+        var phase = [Float](repeating: 0, count: f)
+        for i in 0..<n { phase[i % f] += d[i] }
+        guard let k = phase.indices.max(by: { phase[$0] < phase[$1] }), phase[k] > 1e-6 else { return 1 }
+        var other: Float = 0
+        for i in 0..<f where i != k { other = max(other, phase[i]) }
+        return other / phase[k]
     }
 
     private static func reconstructionError(_ Y: [Float], _ w: Int, _ h: Int, _ f: Int) -> Float {

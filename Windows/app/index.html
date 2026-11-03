@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; worker-src 'self' blob:; connect-src 'self' blob: data:; font-src 'self'">
+<title>Texel</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="aurora" id="aurora" aria-hidden="true"><i class="a1"></i><i class="a2"></i><i class="a3"></i></div>
+
+<header class="titlebar" id="titlebar">
+  <div class="tb-left">
+    <button class="tb-btn" id="btnClose" title="Close image (Esc)" aria-label="Close image" hidden></button>
+  </div>
+  <div class="tb-title" id="tbTitle" hidden><span id="tbSpark"></span>Texel</div>
+  <div class="tb-right">
+    <div class="tb-group" id="tbGroup" hidden>
+      <button class="tb-btn" id="btnAdd" title="Open another image (Ctrl+O)" aria-label="Open another image"></button>
+      <div class="tb-split">
+        <button class="tb-btn" id="btnSave" title="Save as PNG (Ctrl+S)" aria-label="Save"></button>
+        <button class="tb-btn tb-chev" id="btnSaveMenu" title="More formats" aria-label="More formats"></button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+  <section class="home" id="home">
+    <button class="about-btn" id="btnAbout" title="About Texel" aria-label="About Texel"></button>
+    <div class="home-col">
+      <div class="spacer"></div>
+      <div class="logo-wrap st" style="--i:0">
+        <div class="logo-glow"></div>
+        <img class="logo" src="img/logo.png" alt="" draggable="false">
+      </div>
+      <h1 class="st" style="--i:1">Texel</h1>
+      <p class="tagline st" style="--i:2">Small photo in.<br>Stunning detail out.</p>
+      <div class="features" id="features"></div>
+      <div class="spacer grow"></div>
+      <div class="home-buttons">
+        <button class="btn-primary st" style="--i:6" id="btnOpen"></button>
+        <button class="btn-secondary st" style="--i:7" id="btnPaste"></button>
+        <p class="hint st" style="--i:8">or drop an image anywhere</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="editor" id="editor" hidden>
+    <div class="stage" id="stage">
+      <canvas id="view"></canvas>
+      <div class="knob" id="knob" hidden></div>
+      <div class="scan" id="scan" hidden><div class="band"></div></div>
+      <div class="labels">
+        <span class="tag" id="tagBefore">BEFORE</span>
+        <span class="tag hl" id="tagAfter"></span>
+      </div>
+      <div class="info" id="info"></div>
+    </div>
+    <aside class="side">
+      <div class="panel glass" id="panel"></div>
+      <div class="runcard glass" id="runcard" hidden></div>
+    </aside>
+  </section>
+</main>
+
+<div class="toast glass" id="toast" hidden></div>
+<div class="loading glass" id="loading" hidden><div class="spinner"></div><span>Opening image…</span></div>
+<div class="menu glass" id="saveMenu" hidden></div>
+<div class="menu glass" id="addMenu" hidden></div>
+<div class="drop" id="drop" hidden><div><span id="dropIcon"></span>Drop to open</div></div>
+<div class="modal" id="modal" hidden><div class="dialog glass" id="dialog" role="dialog" aria-modal="true"></div></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

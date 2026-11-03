@@ -179,6 +179,8 @@ struct ContentView: View {
     @State private var showFiles = false
     @State private var zoomPercent = 0.0
     @State private var exitPrompt: ExitPrompt?
+    /// iPhone only: the controls tuck away so the finished image gets the screen.
+    @State private var controlsCollapsed = false
 
     enum ExitPrompt { case running, unsaved }
 
@@ -292,6 +294,12 @@ struct ContentView: View {
 
     // MARK: editor
 
+    #if os(iOS)
+    static let canCollapse = UIDevice.current.userInterfaceIdiom == .phone
+    #else
+    static let canCollapse = false
+    #endif
+
     private var editor: some View {
         GeometryReader { geo in
             // Wide windows (Mac, iPad landscape) put the controls beside the image.
@@ -315,11 +323,20 @@ struct ContentView: View {
                         RunCard(state: state, onStartOver: { exitPrompt = .running })
                             .transition(.move(edge: wide ? .trailing : .bottom).combined(with: .opacity))
                     } else {
-                        ControlsPanel(state: state)
+                        ControlsPanel(state: state, collapsible: Self.canCollapse && !wide,
+                                      collapsed: $controlsCollapsed)
                             .transition(.move(edge: wide ? .trailing : .bottom).combined(with: .opacity))
                     }
                 }
                 .animation(Theme.spring, value: state.isRunning)
+                // Tuck the controls away when an upscale finishes, and bring them back for a new photo.
+                .onChange(of: state.completedRuns) { _, _ in
+                    guard Self.canCollapse else { return }
+                    withAnimation(Theme.spring) { controlsCollapsed = true }
+                }
+                .onChange(of: state.result == nil) { _, cleared in
+                    if cleared { withAnimation(Theme.spring) { controlsCollapsed = false } }
+                }
                 .frame(width: wide ? 380 : nil)
                 .padding(wide ? EdgeInsets(top: 12, leading: 4, bottom: 16, trailing: 16)
                               : EdgeInsets(top: 0, leading: 12, bottom: 6, trailing: 12))
@@ -690,7 +707,7 @@ struct AboutView: View {
                 }
 
                 section("Privacy", "Texel upscales your images entirely on this device. It doesn't collect, upload or share any data, and has no accounts, ads or tracking.")
-                section("How it works", "AI mode uses Real-ESRGAN neural networks running on the Neural Engine and GPU through Core ML. Classic mode uses GPU shaders: edge-directed upscaling (AMD FidelityFX Super Resolution 1), detail refinement and contrast-adaptive sharpening.")
+                section("How it works", "AI mode uses Real-ESRGAN neural networks running on the Neural Engine and GPU through Core ML. Enhance redraws faces with GFPGAN and fixes colour and light with Apple's automatic adjustments. Classic mode uses GPU shaders: edge-directed upscaling (AMD FidelityFX Super Resolution 1), detail refinement and contrast-adaptive sharpening.")
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Acknowledgements").font(.headline)
@@ -704,6 +721,9 @@ struct AboutView: View {
                         .padding(12)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.05)))
+                    Text("Face restoration uses GFPGAN v1.4 by Xintao Wang et al. (github.com/TencentARC/GFPGAN), used under the Apache License 2.0. The full licence is included in the app.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(24)
@@ -725,10 +745,23 @@ struct AboutView: View {
 
 struct ControlsPanel: View {
     @ObservedObject var state: AppState
+    /// iPhone: show a pill that tucks the controls away with a swipe down.
+    var collapsible = false
+    var collapsed: Binding<Bool> = .constant(false)
     @Namespace private var chips
+    @GestureState private var drag: CGFloat = 0
+    @State private var tab: AdjustTab = .finish
+
+    enum AdjustTab: Hashable { case finish, enhance }
+
+    private var isCollapsed: Bool { collapsible && collapsed.wrappedValue }
 
     var body: some View {
         VStack(spacing: 14) {
+            if collapsible {
+                grabber
+            }
+
             if state.result != nil {
                 PillPicker(options: [
                     .init(value: ViewMode.split, title: "Split", symbol: "rectangle.split.2x1"),
@@ -736,10 +769,92 @@ struct ControlsPanel: View {
                     .init(value: ViewMode.after, title: "After"),
                 ], selection: $state.viewMode, compact: true)
                 .transition(.move(edge: .top).combined(with: .opacity))
+            } else if isCollapsed {
+                collapsedSummary
+                    .transition(.opacity)
             }
+
+            if !isCollapsed {
+                fullControls
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, collapsible ? 6 : 16)
+        .padding(.bottom, 16)
+        .glassCard()
+        // Follow the finger a little while dragging, with resistance, so the pill feels attached.
+        .offset(y: dragOffset)
+        .animation(Theme.spring, value: state.result != nil)
+        .animation(Theme.spring, value: isCollapsed)
+        .sensoryFeedback(.impact(weight: .light), trigger: isCollapsed)
+    }
+
+    private var dragOffset: CGFloat {
+        guard collapsible, drag != 0 else { return 0 }
+        if drag > 0 { return isCollapsed ? drag * 0.12 : drag * 0.45 }
+        return drag * (isCollapsed ? 0.3 : 0.08)
+    }
+
+    private func setCollapsed(_ value: Bool) {
+        guard collapsed.wrappedValue != value else { return }
+        withAnimation(Theme.spring) { collapsed.wrappedValue = value }
+    }
+
+    /// The pill. Swipe down to hide the controls, up (or tap) to bring them back.
+    private var grabber: some View {
+        Capsule()
+            .fill(.white.opacity(drag != 0 ? 0.55 : 0.32))
+            .frame(width: drag != 0 ? 44 : 38, height: 5)
+            .frame(maxWidth: .infinity)
+            .padding(.top, 4)
+            .padding(.bottom, isCollapsed && state.result == nil ? 0 : -4)
+            .frame(height: 22)
+            .contentShape(Rectangle())
+            .animation(Theme.snappy, value: drag != 0)
+            .gesture(
+                DragGesture(minimumDistance: 3)
+                    .updating($drag) { v, s, _ in s = v.translation.height }
+                    .onEnded { v in
+                        let dy = v.predictedEndTranslation.height
+                        if dy > 40 { setCollapsed(true) } else if dy < -40 { setCollapsed(false) }
+                    }
+            )
+            .onTapGesture { setCollapsed(!collapsed.wrappedValue) }
+            .accessibilityElement()
+            .accessibilityLabel(isCollapsed ? "Show controls" : "Hide controls")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { setCollapsed(!collapsed.wrappedValue) }
+    }
+
+    /// One line in place of the controls when they're hidden and there's no result yet.
+    private var collapsedSummary: some View {
+        Button { setCollapsed(false) } label: {
+            HStack(spacing: 8) {
+                Image(systemName: state.useAI ? "sparkles" : "cpu")
+                    .foregroundStyle(Theme.violet)
+                Text(state.useAI ? "AI · \(state.aiModel.shortTitle)" : "Classic · \(state.preset.rawValue)")
+                Text("·").foregroundStyle(.secondary)
+                Text(state.scale == 1 ? "Enhance" : scaleText(state.scale))
+                Spacer()
+                Image(systemName: "chevron.up")
+                    .font(.footnote.weight(.bold))
+                    .foregroundStyle(.secondary)
+            }
+            .font(.subheadline.weight(.semibold))
+            .padding(.horizontal, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var fullControls: some View {
+        VStack(spacing: 14) {
+            AutoFixButton(state: state)
 
             row("Size") {
                 PillPicker(options: [
+                    .init(value: 1.0, title: "1×"),
                     .init(value: 2.0, title: "2×"),
                     .init(value: 3.0, title: "3×"),
                     .init(value: 4.0, title: "4×"),
@@ -755,40 +870,59 @@ struct ControlsPanel: View {
                 ], selection: $state.useAI)
             }
 
-            Group {
-                if state.useAI {
-                    VStack(spacing: 12) {
-                        HStack(spacing: 8) {
-                            ForEach(AIModel.allCases, id: \.self) { m in
-                                ModelChip(model: m, selected: state.aiModel == m, namespace: chips) {
-                                    withAnimation(Theme.snappy) { state.aiModel = m }
-                                }
-                            }
+            if state.useAI {
+                HStack(spacing: 8) {
+                    ForEach(AIModel.allCases, id: \.self) { m in
+                        ModelChip(model: m, selected: state.aiModel == m, namespace: chips) {
+                            withAnimation(Theme.snappy) { state.aiModel = m }
                         }
-                        .sensoryFeedback(.selection, trigger: state.aiModel)
-                        sliderRow("Detail", value: $state.detail, tint: Theme.violet)
-                        sliderRow("Smooth", value: $state.smooth, tint: Theme.indigo)
-                        sliderRow("Sharp", value: $state.sharpen, tint: Theme.gold)
                     }
-                    .transition(.move(edge: .leading).combined(with: .opacity))
-                } else {
-                    PillPicker(options: [
-                        .init(value: Preset.fast, title: "Fast"),
-                        .init(value: Preset.balanced, title: "Balanced"),
-                        .init(value: Preset.best, title: "Best"),
-                    ], selection: $state.preset, compact: true)
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+                .sensoryFeedback(.selection, trigger: state.aiModel)
+                .transition(.move(edge: .leading).combined(with: .opacity))
+            }
+
+            PillPicker(options: [
+                .init(value: AdjustTab.finish, title: state.useAI ? "Finish" : "Quality", symbol: "slider.horizontal.3"),
+                .init(value: AdjustTab.enhance, title: "Enhance", symbol: "wand.and.stars"),
+            ], selection: $tab, compact: true)
+
+            Group {
+                switch tab {
+                case .finish:
+                    if state.useAI {
+                        VStack(spacing: 12) {
+                            sliderRow("AI", value: $state.aiStrength, tint: .teal)
+                            sliderRow("Detail", value: $state.detail, tint: Theme.violet)
+                            sliderRow("Smooth", value: $state.smooth, tint: Theme.indigo)
+                            sliderRow("Sharp", value: $state.sharpen, tint: Theme.gold)
+                        }
+                        .transition(.opacity)
+                    } else {
+                        PillPicker(options: [
+                            .init(value: Preset.fast, title: "Fast"),
+                            .init(value: Preset.balanced, title: "Balanced"),
+                            .init(value: Preset.best, title: "Best"),
+                        ], selection: $state.preset, compact: true)
+                        .transition(.opacity)
+                    }
+                case .enhance:
+                    VStack(spacing: 12) {
+                        toggleRow("Faces", symbol: "face.smiling", isOn: $state.restoreFaces,
+                                  value: $state.faceStrength, tint: Theme.violet)
+                        toggleRow("Colour", symbol: "camera.filters", isOn: $state.autoEnhance,
+                                  value: $state.enhanceAmount, tint: Theme.gold)
+                    }
+                    .transition(.opacity)
                 }
             }
             .animation(Theme.spring, value: state.useAI)
+            .animation(Theme.snappy, value: tab)
 
             statusLine
 
             UpscaleButton(state: state)
         }
-        .padding(16)
-        .glassCard()
-        .animation(Theme.spring, value: state.result != nil)
     }
 
     private func row<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -828,12 +962,78 @@ struct ControlsPanel: View {
         }
     }
 
+    /// An on/off pill plus a strength slider (Enhance).
+    private func toggleRow(_ title: String, symbol: String, isOn: Binding<Bool>,
+                           value: Binding<Double>, tint: Color) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                withAnimation(Theme.snappy) { isOn.wrappedValue.toggle() }
+                state.applyDetail()
+            } label: {
+                Label(title, systemImage: symbol)
+                    .font(.subheadline.weight(.semibold))
+                    .labelStyle(.titleAndIcon)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .foregroundStyle(isOn.wrappedValue ? Color.white : Color.white.opacity(0.55))
+                    .frame(width: 94, alignment: .leading)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(
+                        Capsule().fill(isOn.wrappedValue ? AnyShapeStyle(tint.opacity(0.35)) : AnyShapeStyle(Color.white.opacity(0.06)))
+                    )
+                    .overlay(Capsule().strokeBorder(isOn.wrappedValue ? tint : Color.white.opacity(0.12), lineWidth: 1))
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(PressableStyle())
+            .sensoryFeedback(.selection, trigger: isOn.wrappedValue)
+            .accessibilityValue(isOn.wrappedValue ? "On" : "Off")
+
+            Slider(value: value, in: 0...1) { editing in
+                if !editing { state.applyDetail() }
+            }
+            .tint(tint)
+            .disabled(!isOn.wrappedValue)
+            .opacity(isOn.wrappedValue ? 1 : 0.35)
+
+            Text(isOn.wrappedValue ? "\(Int((value.wrappedValue * 100).rounded()))%" : "Off")
+                .font(.footnote.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 40, alignment: .trailing)
+                .overlay(alignment: .trailing) {
+                    if state.isBlending {
+                        ProgressView().controlSize(.mini).offset(x: 16)
+                    }
+                }
+        }
+    }
+
     @ViewBuilder
     private var statusLine: some View {
         if let blocker = state.blocker {
             Label(blocker, systemImage: "exclamationmark.triangle.fill")
                 .font(.footnote)
                 .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .transition(.opacity)
+        } else if let summary = state.autoSummary, tab == .finish {
+            Label(summary, systemImage: "wand.and.stars")
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(Theme.gold)
+                .lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .transition(.opacity)
+        } else if state.scale == 1 && tab == .finish {
+            Text("1× keeps the size and rebuilds the image: the AI redraws it at 4× detail, then shrinks it back, removing blur, noise and compression.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .transition(.opacity)
+        } else if tab == .enhance {
+            Text("Faces redraws blurry faces with a face AI. Colour fixes light and colour and adds clarity to texture like trees and fabric.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .transition(.opacity)
         } else {
@@ -846,6 +1046,54 @@ struct ControlsPanel: View {
                 .transition(.opacity)
                 .animation(.easeInOut(duration: 0.25), value: state.aiModel)
         }
+    }
+}
+
+/// Auto Fix: analyses the image, picks every setting to suit it, and runs.
+struct AutoFixButton: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        let busy = state.isAnalyzing || state.isRunning
+        Button { state.autoFix() } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "wand.and.stars")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Theme.gold)
+                    .symbolEffect(.bounce, value: state.isAnalyzing)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Auto Fix")
+                        .font(.subheadline.weight(.bold))
+                    Text(state.isAnalyzing ? "Looking for blur, noise, faces and lighting…"
+                                           : "Finds what's wrong and fixes it, keeping the look")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                if state.isAnalyzing {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.right").font(.subheadline.weight(.bold)).foregroundStyle(.secondary)
+                }
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Theme.gold.opacity(0.12))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Theme.gold.opacity(0.55), lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .opacity(busy && !state.isAnalyzing ? 0.45 : 1)
+        }
+        .buttonStyle(PressableStyle())
+        .disabled(busy)
+        .keyboardShortcut("a", modifiers: [.command, .shift])
+        .sensoryFeedback(.impact(weight: .light), trigger: state.isAnalyzing) { _, now in now }
     }
 }
 
@@ -862,10 +1110,10 @@ struct UpscaleButton: View {
                     .font(.headline)
                     .symbolEffect(.pulse, options: .repeating, isActive: !disabled)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(state.useAI ? "Upscale with AI" : "Upscale")
+                    Text(state.scale == 1 ? "Enhance with AI" : state.useAI ? "Upscale with AI" : "Upscale")
                         .font(.headline)
                     if let size = state.outputSize {
-                        Text("→ \(size.0) × \(size.1) px")
+                        Text(state.scale == 1 ? "Same size · \(size.0) × \(size.1) px" : "→ \(size.0) × \(size.1) px")
                             .font(.caption2.monospacedDigit().weight(.semibold))
                             .opacity(0.8)
                             .contentTransition(.numericText())

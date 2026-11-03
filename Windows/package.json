@@ -1,0 +1,52 @@
+{
+  "name": "texel",
+  "productName": "Texel",
+  "version": "1.0.0",
+  "description": "On-device AI image upscaler",
+  "author": "Texel",
+  "license": "UNLICENSED",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win zip --x64"
+  },
+  "devDependencies": {
+    "electron": "44.9.3",
+    "electron-builder": "26.15.0",
+    "resedit": "2.0.3",
+    "@fontsource-variable/nunito": "5.3.0",
+    "onnxruntime-web": "1.30.0"
+  },
+  "build": {
+    "appId": "com.mspra.texel",
+    "productName": "Texel",
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json",
+      "app/**/*"
+    ],
+    "asar": true,
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "electronLanguages": [
+      "en-US"
+    ],
+    "afterPack": "build/afterPack.js",
+    "win": {
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false
+    },
+    "artifactName": "Texel-Windows-${version}.${ext}"
+  }
+}

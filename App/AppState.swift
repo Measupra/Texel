@@ -35,6 +35,18 @@ final class AppState: ObservableObject {
     @Published var sharpen: Double = 0.25
     /// Edge-preserving smoothing applied after the AI (0 = none). Evens out blockiness and noise.
     @Published var smooth: Double = 0.35
+    /// How much of the AI result to use (the rest is a plain enlargement). Lower keeps it closer
+    /// to the original and avoids an over-processed look.
+    @Published var aiStrength: Double = 1.0
+    /// Auto Fix: true while the image is being analysed; `autoSummary` says what it found and did.
+    @Published var isAnalyzing = false
+    @Published var autoSummary: String?
+    /// Enhance: redraw faces with the face AI, blended in at `faceStrength`.
+    @Published var restoreFaces = true
+    @Published var faceStrength: Double = 0.7
+    /// Enhance: automatic colour, light and clarity, blended in at `enhanceAmount`.
+    @Published var autoEnhance = true
+    @Published var enhanceAmount: Double = 0.6
     @Published var isBlending = false
     /// True once the current result has been saved to Photos or shared.
     @Published var isSaved = false
@@ -48,10 +60,11 @@ final class AppState: ObservableObject {
     @Published private(set) var engine: Engine?
 
     let ai = AIUpscaler()
-    /// The unblended AI output, kept so the Detail slider can re-blend without re-running the AI.
-    private var aiRaw: CGImage?
-    /// Where Detail borrows texture from (the original, or its real-resolution version).
-    private var detailSource: CGImage?
+    lazy var faceRestorer = FaceRestorer(models: ai)
+    /// The plain upscale, kept so the finishing sliders and Enhance can be redone without re-running it.
+    private var base: ResultBase?
+    /// Faces the face AI restored for `base` (nil = not worked out yet).
+    private var faces: [RestoredFace]?
     /// Bumped by each run and by goHome(), so a finished or cancelled run never touches a newer state.
     private var runID = 0
     private var cancelFlag = CancelFlag()
@@ -82,6 +95,11 @@ final class AppState: ObservableObject {
 
     // MARK: derived
 
+    var currentLook: Look {
+        Look(strength: aiStrength, detail: detail, sharpen: sharpen, smooth: smooth,
+             faces: restoreFaces ? faceStrength : 0, enhance: autoEnhance ? enhanceAmount : 0)
+    }
+
     var outputSize: (Int, Int)? {
         guard let s = source else { return nil }
         return Engine.outputSize(width: s.width, height: s.height, scale: scale)
@@ -97,6 +115,7 @@ final class AppState: ObservableObject {
                 return "\(w) × \(h) is too large for this \(AppState.deviceName). Pick a smaller scale."
             }
         } else {
+            if scale == 1 { return "1× (enhance without enlarging) needs AI mode." }
             if engine == nil { return "The GPU is still getting ready." }
             if w * h > AppState.classicMaxPixels { return "\(w) × \(h) is too large for Classic on this \(AppState.deviceName). Use AI or a smaller scale." }
         }
@@ -146,8 +165,9 @@ final class AppState: ObservableObject {
         }.value
         source = img
         result = nil
-        aiRaw = nil
-        detailSource = nil
+        base = nil
+        faces = nil
+        autoSummary = nil
         lastDuration = nil
         resultLabel = ""
         viewMode = .split
@@ -160,11 +180,14 @@ final class AppState: ObservableObject {
         guard let src = source, !isRunning, blocker == nil, let size = outputSize else { return }
         let outW = size.0, outH = size.1
         let useAI = self.useAI, model = aiModel, ai = self.ai, engine = self.engine
-        let detail = self.detail, sharpen = self.sharpen, smooth = self.smooth
+        let look = currentLook
+        let restorer = faceRestorer
+        let wantFaces = restoreFaces && restorer.isAvailable
         var settings = UpscaleSettings()
         preset.apply(to: &settings)
         settings.scale = scale
-        let label = useAI ? "AI \(model.shortTitle) \(scaleText(scale))" : "\(preset.rawValue) \(scaleText(scale))"
+        let sizeLabel = scale == 1 ? "Enhanced" : scaleText(scale)
+        let label = useAI ? "AI \(model.shortTitle) \(sizeLabel)" : "\(preset.rawValue) \(sizeLabel)"
         let flag = CancelFlag()
         cancelFlag = flag
         runID += 1
@@ -188,42 +211,57 @@ final class AppState: ObservableObject {
                         self.stage = p.stage
                     }
                 }
-                let image: CGImage
-                var raw: CGImage?
-                var detailSrc: CGImage?
+                let resultBase: ResultBase
                 var rebuiltFrom = 1
                 if useAI {
                     let r = try ai.upscaleDetailed(src, model: model, outW: outW, outH: outH,
                                                    progress: report, isCancelled: { flag.isSet })
-                    raw = r.image
-                    detailSrc = r.detailSource
                     rebuiltFrom = r.rebuiltFrom
-                    report(EngineProgress(stage: "Finishing: detail, smoothing, sharpening", fraction: 0.99))
-                    image = Finisher.apply(ai: r.image, detailSource: r.detailSource,
-                                           detail: detail, sharpen: sharpen, smooth: smooth)
+                    resultBase = ResultBase(image: r.image, detailSource: r.detailSource, useFinisher: true)
                 } else if let engine {
-                    image = try engine.upscale(src, settings: settings, progress: report, isCancelled: { flag.isSet })
+                    let image = try engine.upscale(src, settings: settings, progress: report, isCancelled: { flag.isSet })
+                    resultBase = ResultBase(image: image, detailSource: src.cgImage, useFinisher: false)
                 } else {
                     throw EngineError.noGPU
                 }
+
+                // Enhance: faces first (the slow part), so changing strengths later is instant.
+                var restored: [RestoredFace]?
+                if wantFaces {
+                    do {
+                        restored = try restorer.restore(resultBase.detailSource, progress: { s in
+                            report(EngineProgress(stage: s, fraction: 0.985))
+                        }, isCancelled: { flag.isSet })
+                    } catch EngineError.cancelled {
+                        throw EngineError.cancelled
+                    } catch {
+                        restored = []   // Faces are a bonus: never fail the whole upscale over them.
+                    }
+                }
+                report(EngineProgress(stage: "Finishing touches", fraction: 0.99))
+                let image = Composer.compose(resultBase, faces: restored ?? [], look: look)
                 let took = Date().timeIntervalSince(start)
-                let rawResult = raw, detailResult = detailSrc, rebuilt = rebuiltFrom
+                let rebuilt = rebuiltFrom, faceCount = restored?.count ?? 0
                 let srcSize = (src.width, src.height)
                 await MainActor.run {
                     guard self.runID == id else { return }
                     self.finish()
                     self.result = image
                     self.isSaved = false
-                    self.aiRaw = rawResult
-                    self.detailSource = detailResult
+                    self.base = resultBase
+                    self.faces = restored
                     self.lastDuration = took
                     self.resultLabel = label
                     self.viewMode = .split
                     self.completedRuns += 1
                     self.revealResult()
                     if rebuilt > 1 {
-                        self.showToast("Low-res photo detected. Rebuilt from \(srcSize.0 / rebuilt)×\(srcSize.1 / rebuilt)", icon: "wand.and.stars")
+                        self.showToast("Pixelated image detected. Rebuilt from \(srcSize.0 / rebuilt)×\(srcSize.1 / rebuilt)", icon: "wand.and.stars")
+                    } else if faceCount > 0 && look.faces > 0 {
+                        self.showToast(faceCount == 1 ? "Restored 1 face" : "Restored \(faceCount) faces", icon: "face.smiling")
                     }
+                    // Settings changed while it ran: bring the result up to date.
+                    if self.currentLook != look { self.applyDetail() }
                 }
             } catch EngineError.cancelled {
                 await MainActor.run {
@@ -236,6 +274,38 @@ final class AppState: ObservableObject {
                     guard self.runID == id else { return }
                     self.finish()
                     self.errorMessage = msg
+                }
+            }
+        }
+    }
+
+    /// Auto Fix: looks at the image, picks the model, size and every setting to suit what's wrong
+    /// with it, then runs.
+    func autoFix() {
+        guard let src = source, !isRunning, !isAnalyzing else { return }
+        isAnalyzing = true
+        Task.detached(priority: .userInitiated) {
+            let report = ImageAnalyzer.analyze(src.cgImage)
+            let plan = ImageAnalyzer.plan(for: report, width: src.width, height: src.height)
+            await MainActor.run {
+                self.isAnalyzing = false
+                guard self.source?.cgImage === src.cgImage else { return }
+                self.useAI = true
+                self.aiModel = plan.model
+                self.scale = plan.scale
+                self.aiStrength = plan.strength
+                self.detail = plan.detail
+                self.smooth = plan.smooth
+                self.sharpen = plan.sharpen
+                self.restoreFaces = plan.restoreFaces
+                self.faceStrength = plan.faceStrength
+                self.autoEnhance = plan.autoEnhance
+                self.enhanceAmount = plan.enhanceAmount
+                self.autoSummary = plan.summary
+                if let blocker = self.blocker {
+                    self.errorMessage = blocker
+                } else {
+                    self.run()
                 }
             }
         }
@@ -271,8 +341,8 @@ final class AppState: ObservableObject {
         runID += 1
         source = nil
         result = nil
-        aiRaw = nil
-        detailSource = nil
+        base = nil
+        faces = nil
         isSaved = false
         lastDuration = nil
         resultLabel = ""
@@ -296,25 +366,36 @@ final class AppState: ObservableObject {
         #endif
     }
 
-    // MARK: finishing (detail + sharpen)
+    // MARK: finishing (detail, sharpen, smooth, Enhance)
 
-    /// Re-applies Detail and Sharpen to the last AI result, without running the AI again.
+    /// Redoes the finishing sliders and Enhance on the last upscale, without running the upscale again.
+    /// Faces are worked out once (the first time they're asked for) and then reused.
     func applyDetail() {
-        guard let raw = aiRaw, let detailSrc = detailSource, !isRunning, !isBlending else { return }
-        let detail = self.detail, sharpen = self.sharpen, smooth = self.smooth
+        guard let base, !isRunning, !isBlending else { return }
+        let look = currentLook
+        let restorer = faceRestorer
+        let needFaces = look.faces > 0 && faces == nil && restorer.isAvailable
+        let cached = faces ?? []
         isBlending = true
         Task.detached(priority: .userInitiated) {
-            let image = Finisher.apply(ai: raw, detailSource: detailSrc,
-                                       detail: detail, sharpen: sharpen, smooth: smooth)
+            var found = cached
+            if needFaces {
+                found = (try? restorer.restore(base.detailSource, progress: { _ in }, isCancelled: { false })) ?? []
+            }
+            let image = Composer.compose(base, faces: found, look: look)
             await MainActor.run {
                 self.isBlending = false
                 // Ignore the result if a new image or run replaced the one it came from.
-                if self.aiRaw === raw {
-                    self.result = image
-                    self.isSaved = false
+                guard self.base === base else { return }
+                if needFaces {
+                    self.faces = found
+                    if !found.isEmpty {
+                        self.showToast(found.count == 1 ? "Restored 1 face" : "Restored \(found.count) faces", icon: "face.smiling")
+                    }
                 }
-                if abs(self.detail - detail) > 0.001 || abs(self.sharpen - sharpen) > 0.001
-                    || abs(self.smooth - smooth) > 0.001 { self.applyDetail() }
+                self.result = image
+                self.isSaved = false
+                if self.currentLook != look { self.applyDetail() }
             }
         }
     }
@@ -415,13 +496,49 @@ final class AppState: ObservableObject {
     }
 }
 
+// MARK: - Composing the result
+
+/// The plain upscale a result is built from.
+final class ResultBase: @unchecked Sendable {
+    let image: CGImage
+    /// Where Detail borrows texture from, and where faces are found.
+    let detailSource: CGImage
+    /// Detail, Smooth and Sharp apply to AI results only (Classic has its own sharpening).
+    let useFinisher: Bool
+    init(image: CGImage, detailSource: CGImage, useFinisher: Bool) {
+        self.image = image; self.detailSource = detailSource; self.useFinisher = useFinisher
+    }
+}
+
+/// Every adjustable setting that shapes the final image. Zero means off.
+struct Look: Equatable, Sendable {
+    var strength: Double
+    var detail: Double, sharpen: Double, smooth: Double
+    var faces: Double, enhance: Double
+}
+
+enum Composer {
+    /// Plain upscale → Detail / Smooth / Sharp → restored faces → colour & light.
+    static func compose(_ base: ResultBase, faces: [RestoredFace], look: Look) -> CGImage {
+        var image = base.image
+        if base.useFinisher {
+            image = Finisher.apply(ai: image, detailSource: base.detailSource, strength: look.strength,
+                                   detail: look.detail, sharpen: look.sharpen, smooth: look.smooth)
+        }
+        if look.faces > 0.001 { image = FaceRestorer.paste(faces, onto: image, strength: look.faces) }
+        if look.enhance > 0.001 { image = Enhancer.apply(image, amount: look.enhance) }
+        return image
+    }
+}
+
 // MARK: - Finishing
 
 /// Runs after the AI: adds back the original's fine texture (only its fine detail, so it never blurs
 /// the result) and sharpens. CPU work with Accelerate; about a second on a large image.
 enum Finisher {
-    static func apply(ai: CGImage, detailSource: CGImage, detail: Double, sharpen: Double, smooth: Double) -> CGImage {
-        guard detail > 0.001 || sharpen > 0.001 || smooth > 0.001 else { return ai }
+    static func apply(ai: CGImage, detailSource: CGImage, strength: Double = 1,
+                      detail: Double, sharpen: Double, smooth: Double) -> CGImage {
+        guard detail > 0.001 || sharpen > 0.001 || smooth > 0.001 || strength < 0.999 else { return ai }
         let w = ai.width, h = ai.height, rowBytes = w * 4
         let space = ai.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
         let hasAlpha: Bool
@@ -436,21 +553,27 @@ enum Finisher {
         // How much bigger the result is than the detail it can trust.
         let ratio = Double(w) / Double(max(1, detailSource.width))
 
-        // Detail: the original's high-frequency texture, enlarged with Lanczos.
-        if detail > 0.001 {
+        // The original enlarged with Lanczos: for AI strength and for Detail.
+        if detail > 0.001 || strength < 0.999 {
             var s = [UInt8](repeating: 255, count: detailSource.width * detailSource.height * 4)
             if draw(detailSource, into: &s, detailSource.width, detailSource.height, space, info) {
                 var l = [UInt8](repeating: 255, count: rowBytes * h)
                 let scaled = scale(&s, detailSource.width, detailSource.height, into: &l, w, h)
                 s = []
-                if scaled {
+                // AI strength: blend from the plain enlargement (0) to the full AI result (1).
+                if scaled && strength < 0.999 {
+                    mix(&a, toward: l, amount: Float(1 - max(0, strength)))
+                }
+                if scaled && detail > 0.001 {
                     var k = Int(ratio.rounded()) * 2 + 1
                     k = max(3, min(k, 15))
                     var lb = [UInt8](repeating: 255, count: rowBytes * h)
                     if tent(&l, into: &lb, w, h, size: k) {
                         // At big enlargements the original's "texture" is really its pixel grid and
                         // compression blocks, so add much less of it: full at 2×, about 1/8 at 8×.
-                        let gain = Float(detail * 1.5 * min(1, pow(2 / max(ratio, 1), 1.5)))
+                        // At 1× (Enhance) the original's fine detail includes the noise the AI just
+                        // removed, so add back only half as much.
+                        let gain = Float(detail * 1.5 * min(1, pow(2 / max(ratio, 1), 1.5)) * min(1, max(ratio, 1) / 2))
                         combine(&a, plus: l, minus: lb, gain: gain, hasAlpha: hasAlpha)
                     }
                 }
@@ -468,12 +591,15 @@ enum Finisher {
             }
         }
 
-        // Sharpen: unsharp mask on the result.
+        // Sharpen: unsharp mask on the result. The radius grows with the enlargement, so it works on
+        // detail you can actually see (a 2-pixel radius on a 4× result is invisible unless zoomed in).
         if sharpen > 0.001 {
+            var k = Int(ratio.rounded()) * 2 + 1
+            k = max(3, min(k, 15))
             var b = [UInt8](repeating: 255, count: rowBytes * h)
-            if tent(&a, into: &b, w, h, size: 5) {
+            if tent(&a, into: &b, w, h, size: k) {
                 let base = a
-                combine(&a, plus: base, minus: b, gain: Float(sharpen * 1.2), hasAlpha: hasAlpha)
+                combine(&a, plus: base, minus: b, gain: Float(sharpen * 1.6), hasAlpha: hasAlpha)
             }
         }
 
@@ -518,6 +644,18 @@ enum Finisher {
                                        width: vImagePixelCount(w), rowBytes: w * 4)
                 return vImageTentConvolve_ARGB8888(&sb, &db, nil, 0, 0, UInt32(size), UInt32(size), nil,
                                                    vImage_Flags(kvImageEdgeExtend)) == kvImageNoError
+            }
+        }
+    }
+
+    /// a = a + amount × (target − a) on every channel.
+    private static func mix(_ a: inout [UInt8], toward target: [UInt8], amount: Float) {
+        let n = a.count
+        a.withUnsafeMutableBufferPointer { ap in
+            target.withUnsafeBufferPointer { tp in
+                for i in 0..<n {
+                    ap[i] = UInt8(max(0, min(255, (Float(ap[i]) + amount * (Float(tp[i]) - Float(ap[i]))).rounded())))
+                }
             }
         }
     }

@@ -1,7 +1,7 @@
 # Build output and local copies
-build/
-AppStore/
+/build/
 Texel.app
+Texel.zip
 *.ipa
 *.pkg
 *.xcarchive

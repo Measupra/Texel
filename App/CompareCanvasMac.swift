@@ -4,7 +4,7 @@ import AppKit
 import QuartzCore
 
 /// Mac version of the before/after view, with the same look and controls as on iPhone:
-/// pinch or ⌘-scroll to zoom, drag to pan, drag the round handle to compare,
+/// scroll or pinch to zoom, drag (or ⌘-scroll) to pan, drag the round handle to compare,
 /// double-click to switch between fit and actual pixels.
 struct CompareCanvas: NSViewRepresentable {
     var before: CGImage?
@@ -37,7 +37,7 @@ final class MacCenteringClipView: NSClipView {
     }
 }
 
-/// ⌘- or ⌥-scroll zooms around the pointer; plain scrolling pans.
+/// Scrolling (mouse wheel or trackpad) zooms around the pointer; ⌘- or ⌥-scroll pans.
 final class MacZoomScrollView: NSScrollView {
     var onUserZoom: (() -> Void)?
 
@@ -48,10 +48,15 @@ final class MacZoomScrollView: NSScrollView {
 
     override func scrollWheel(with event: NSEvent) {
         let mods = event.modifierFlags
-        guard mods.contains(.command) || mods.contains(.option) else { return super.scrollWheel(with: event) }
+        if mods.contains(.command) || mods.contains(.option) { return super.scrollWheel(with: event) }
+        // Ignore sideways swipes and the tail of a fling, so zooming stops when the fingers do.
+        guard event.momentumPhase.isEmpty, abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX) else { return }
+        // Wheel or fingers moving up zooms in, whichever way "natural scrolling" is set.
+        let dy = event.isDirectionInvertedFromDevice ? -event.scrollingDeltaY : event.scrollingDeltaY
+        guard dy != 0 else { return }
         onUserZoom?()
-        let k: CGFloat = event.hasPreciseScrollingDeltas ? 0.01 : 0.1
-        let factor = exp(event.scrollingDeltaY * k)
+        let k: CGFloat = event.hasPreciseScrollingDeltas ? 0.012 : 0.12
+        let factor = exp(dy * k)
         let p = contentView.convert(event.locationInWindow, from: nil)
         setMagnification(min(maxMagnification, max(minMagnification, magnification * factor)), centeredAt: p)
     }

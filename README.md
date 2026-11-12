@@ -6,22 +6,24 @@
 
 <p align="center">
   <b>Small photo in. Stunning detail out.</b><br>
-  On-device AI image upscaler for Mac and Windows.
+  On-device AI image upscaler for Mac, Windows, iPhone and iPad.
 </p>
 
 <p align="center">
   <a href="https://github.com/Measupra/Texel/releases/latest"><b>⬇ Download for Mac</b></a>
   &nbsp;·&nbsp;
   <a href="https://github.com/Measupra/Texel/releases/latest"><b>⬇ Download for Windows</b></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/Measupra/Texel/releases/latest"><b>⬇ Download for iPhone</b></a>
 </p>
 
-Texel enlarges your photos up to **8×**, or cleans them up at the same size, with AI that runs entirely on your computer. No uploads, no accounts, no tracking.
+Texel enlarges your photos up to **8×**, or cleans them up at the same size, with AI that runs entirely on your own device. No uploads, no accounts, no tracking.
 
 ## Install
 
 ### Mac
 
-1. Download **Texel.zip** from the [latest release](https://github.com/Measupra/Texel/releases/latest).
+1. Download the **Mac .zip** file from the [latest release](https://github.com/Measupra/Texel/releases/latest).
 2. Double-click it to unzip, and drag **Texel** into your **Applications** folder.
 3. Open Texel.
 
@@ -31,7 +33,7 @@ Needs **macOS 14 Sonoma or later**. Works on Apple Silicon and Intel Macs.
 
 ### Windows
 
-1. Download **Texel-Windows-0.2.zip** from the [latest release](https://github.com/Measupra/Texel/releases/latest).
+1. Download the **Windows .zip** file from the [latest release](https://github.com/Measupra/Texel/releases/latest).
 2. Right-click it, choose **Extract All…**, and open the folder.
 3. Double-click **Texel.exe**.
 
@@ -41,7 +43,14 @@ Needs **Windows 10 or 11** (64-bit). A graphics card that supports DirectX 12 ma
 
 ### iPhone and iPad
 
-Texel also runs on iPhone and iPad, but there's no download for it yet: it has to be built and installed from this project with Xcode on a Mac.
+1. Download the **.ipa** file from the [latest release](https://github.com/Measupra/Texel/releases/latest) onto your computer.
+2. Install a sideloading app such as [Sideloadly](https://sideloadly.io) or [AltStore](https://altstore.io) on your Mac or PC.
+3. Connect your iPhone or iPad, choose the .ipa file in the sideloading app, and sign in with your Apple ID when it asks.
+4. On the device, go to **Settings › General › VPN & Device Management**, tap your Apple ID and choose **Trust**. If it asks for Developer Mode, turn that on under **Settings › Privacy & Security**.
+
+With a free Apple ID the app stops opening after 7 days; install it again the same way to keep using it.
+
+Needs **iOS 17 or iPadOS 17 or later**.
 
 ## How to use
 
@@ -80,7 +89,7 @@ Texel also runs on iPhone and iPad, but there's no download for it yet: it has t
 - **Pixelated images** are spotted and rebuilt from their real resolution instead of being enlarged block by block.
 - **Classic mode** offers fast GPU upscaling without AI (AMD FidelityFX Super Resolution 1, detail refinement and sharpening).
 - **Before/after compare** with a draggable divider, zoom and pan.
-- **Private:** everything happens on your computer.
+- **Private:** everything happens on your own device.
 
 ## Credits
 

@@ -264,3 +264,53 @@ input[type=range]:disabled { opacity: .35; cursor: default; }
 .about a { color: #a8baff; cursor: pointer; }
 
 @media (max-width: 900px) { .side { width: 360px; } }
+
+/* ---------- home: paste and batch side by side ---------- */
+.home-row { display: flex; gap: 12px; }
+.home-row .btn-secondary { flex: 1; }
+
+/* ---------- fit to a size ---------- */
+.size-wrap { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
+.fitbtn { width: 38px; height: 38px; flex: none; display: grid; place-items: center; border-radius: 50%; background: rgba(255, 255, 255, .07); color: rgba(255, 255, 255, .7); transition: transform .25s var(--spring), background .2s, color .2s; }
+.fitbtn .ic { width: 16px; height: 16px; }
+.fitbtn:hover { color: #fff; background: rgba(255, 255, 255, .12); }
+.fitbtn:active { transform: scale(.92); }
+.fitbtn.on { background: var(--accent); color: #fff; box-shadow: 0 3px 8px rgba(92, 112, 255, .5); }
+.menu button > .ic { width: 15px; height: 15px; flex: none; }
+.dimmed { opacity: .35; pointer-events: none; transition: opacity .25s; }
+.autofix .state { width: 20px; height: 20px; color: var(--faint); }
+.autofix.toggle-on { background: rgba(255, 204, 115, .22); }
+.autofix.toggle-on .state { color: var(--gold); }
+.dialog input[type=text] { width: 100%; margin: 0 0 16px; padding: 12px 14px; border-radius: 12px; border: 0; background: rgba(255, 255, 255, .08); box-shadow: inset 0 0 0 1px var(--line); color: var(--text); font: inherit; font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.dialog input[type=text]::placeholder { color: var(--faint); font-weight: 600; }
+
+/* ---------- batch ---------- */
+.batch { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px; padding: 10px 14px 16px 22px; min-height: 0; animation: fadeIn .35s ease both; }
+.b-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex: none; }
+.b-head h2 { margin: 0; font-size: 26px; font-weight: 800; }
+.b-head small { color: var(--dim); font-weight: 600; font-variant-numeric: tabular-nums; }
+.b-add { display: flex; align-items: center; gap: 6px; padding: 9px 16px 9px 12px; border-radius: 99px; background: rgba(255, 255, 255, .08); box-shadow: inset 0 0 0 1px var(--line); font-weight: 700; transition: transform .2s var(--spring), opacity .2s; }
+.b-add .ic { width: 15px; height: 15px; color: var(--indigo); stroke-width: 2.6; }
+.b-add:active { transform: scale(.95); }
+.b-add:disabled, .b-dest button:disabled { opacity: .4; }
+.b-rows { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; scrollbar-width: thin; padding-right: 4px; }
+.b-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 16px; background: rgba(255, 255, 255, .05); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .06); flex: none; }
+.b-row .st-ic { width: 22px; height: 22px; flex: none; display: grid; place-items: center; color: var(--faint); }
+.b-row .st-ic .ic { width: 20px; height: 20px; }
+.b-row .t { flex: 1; min-width: 0; }
+.b-row b, .b-row small { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.b-row b { font-weight: 700; }
+.b-row small { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.b-row.running { background: linear-gradient(135deg, rgba(92, 112, 255, .22), rgba(158, 107, 250, .22)); box-shadow: inset 0 0 0 1px rgba(158, 107, 250, .6); }
+.b-row.done .st-ic { color: #4ade80; }
+.b-row.failed .st-ic, .b-row.failed small { color: #fb923c; }
+.b-row .rm { width: 28px; height: 28px; flex: none; display: grid; place-items: center; border-radius: 50%; color: var(--faint); }
+.b-row .rm:hover { background: rgba(255, 255, 255, .1); color: #fff; }
+.b-row .rm .ic { width: 13px; height: 13px; stroke-width: 2.6; }
+.b-empty { margin: auto; color: var(--faint); font-weight: 600; }
+.b-dest { flex: none; display: flex; flex-direction: column; gap: 10px; padding: 12px; border-radius: 18px; background: rgba(255, 255, 255, .05); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .06); }
+.b-dest .line { display: flex; align-items: center; gap: 8px; }
+.b-dest .line > .ic { width: 17px; height: 17px; color: var(--indigo); flex: none; }
+.b-dest .line span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 700; }
+.b-dest .line button { padding: 6px 12px; border-radius: 99px; background: rgba(255, 255, 255, .08); font-size: 13px; font-weight: 700; flex: none; }
+.b-dest .line button:hover { background: rgba(255, 255, 255, .14); }

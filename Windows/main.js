@@ -1,6 +1,6 @@
 // Texel for Windows: the desktop shell. The interface and engine live in ./app and are served from a
 // private app:// origin (secure and cross-origin isolated, which WebGPU and multi-threaded AI need).
-const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, nativeTheme } = require('electron');
+const { app, BrowserWindow, protocol, net, ipcMain, dialog, shell, nativeTheme, clipboard, nativeImage, ClipboardItem } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
@@ -78,6 +78,7 @@ app.whenReady().then(() => {
     headers.set('Cross-Origin-Resource-Policy', 'same-origin');
     return new Response(res.body, { status: res.status, headers });
   });
+  loadSettings();
   createWindow();
 });
 app.on('window-all-closed', () => app.quit());
@@ -106,6 +107,100 @@ ipcMain.handle('save-image', async (_e, { name, ext, data }) => {
   if (r.canceled || !r.filePath) return null;
   await fs.promises.writeFile(r.filePath, Buffer.from(data));
   return path.basename(r.filePath);
+});
+
+// ---------------------------------------------------------------- batch
+
+// Images chosen in the batch dialog are read one at a time, when their turn comes.
+const picked = new Map();
+let pickedId = 0;
+let settings = {};
+const settingsFile = () => path.join(app.getPath('userData'), 'texel-settings.json');
+function loadSettings() {
+  try { settings = JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) || {}; } catch { settings = {}; }
+}
+function saveSettings() {
+  try { fs.writeFileSync(settingsFile(), JSON.stringify(settings)); } catch { /* not worth interrupting for */ }
+}
+const batchFolder = () => settings.batchFolder || path.join(app.getPath('downloads'), 'Texel');
+
+ipcMain.handle('pick-images', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Choose the images to upscale', buttonLabel: 'Add', properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Images', extensions: IMAGE_TYPES }, { name: 'All Files', extensions: ['*'] }],
+  });
+  if (r.canceled) return [];
+  return r.filePaths.map((file) => {
+    const id = ++pickedId;
+    picked.set(id, file);
+    return { id, name: path.basename(file) };
+  });
+});
+
+ipcMain.handle('read-picked', async (_e, id) => {
+  const file = picked.get(id);
+  if (!file) return null;
+  const data = await fs.promises.readFile(file);
+  return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+});
+
+ipcMain.handle('batch-folder', () => batchFolder());
+
+ipcMain.handle('choose-batch-folder', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Choose where Texel saves the upscaled images', buttonLabel: 'Save Here',
+    defaultPath: batchFolder(), properties: ['openDirectory', 'createDirectory'],
+  });
+  if (!r.canceled && r.filePaths.length) { settings.batchFolder = r.filePaths[0]; saveSettings(); }
+  return batchFolder();
+});
+
+// Writes one batch result into the batch folder, never over an existing file.
+ipcMain.handle('write-batch-file', async (_e, { name, data }) => {
+  const folder = batchFolder();
+  await fs.promises.mkdir(folder, { recursive: true });
+  const safe = path.basename(String(name)).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+  const ext = path.extname(safe), stem = safe.slice(0, safe.length - ext.length);
+  let file = path.join(folder, safe);
+  for (let n = 2; fs.existsSync(file); n++) file = path.join(folder, `${stem} ${n}${ext}`);
+  await fs.promises.writeFile(file, Buffer.from(data));
+  return path.basename(file);
+});
+
+ipcMain.handle('show-batch-folder', async () => {
+  const folder = batchFolder();
+  await fs.promises.mkdir(folder, { recursive: true }).catch(() => {});
+  shell.openPath(folder);
+});
+
+// ---------------------------------------------------------------- clipboard
+
+// Electron's clipboard is asynchronous and modelled on the web's (read/write of ClipboardItems);
+// older versions had readImage/writeImage instead, so both are handled.
+ipcMain.handle('clipboard-read-image', async () => {
+  if (typeof clipboard.readImage === 'function') {
+    const img = clipboard.readImage();
+    if (img.isEmpty()) return null;
+    const png = img.toPNG();
+    return png.buffer.slice(png.byteOffset, png.byteOffset + png.byteLength);
+  }
+  for (const item of await clipboard.read()) {
+    const type = item.types.includes('image/png') ? 'image/png' : item.types.find((t) => t.startsWith('image/'));
+    if (type) return (await item.getType(type)).arrayBuffer();
+  }
+  return null;
+});
+
+ipcMain.handle('clipboard-write-image', async (_e, data) => {
+  const png = Buffer.from(data);
+  if (typeof clipboard.writeImage === 'function') {
+    const img = nativeImage.createFromBuffer(png);
+    if (img.isEmpty()) return false;
+    clipboard.writeImage(img);
+    return true;
+  }
+  await clipboard.write([new ClipboardItem({ 'image/png': new Blob([png], { type: 'image/png' }) })]);
+  return true;
 });
 
 ipcMain.handle('read-text', async (_e, rel) => {

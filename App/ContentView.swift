@@ -181,6 +181,9 @@ struct ContentView: View {
     @State private var exitPrompt: ExitPrompt?
     /// iPhone only: the controls tuck away so the finished image gets the screen.
     @State private var controlsCollapsed = false
+    /// Batch on iPhone and iPad: photos picked from the library.
+    @State private var showBatchPicker = false
+    @State private var batchPicks: [PhotosPickerItem] = []
 
     enum ExitPrompt { case running, unsaved }
 
@@ -195,11 +198,16 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                AuroraBackground(intensity: state.source == nil ? 1 : 0.35)
+                AuroraBackground(intensity: state.source == nil && state.batch == nil ? 1 : 0.35)
                     .animation(.easeInOut(duration: 0.8), value: state.source == nil)
+                    .animation(.easeInOut(duration: 0.8), value: state.batch == nil)
 
-                if state.source == nil {
-                    HomeView(showPhotoPicker: $showPhotoPicker, showFiles: $showFiles)
+                if state.batch != nil {
+                    BatchView(state: state, onAdd: addToBatch, onExit: { exitPrompt = .running })
+                        .transition(.opacity)
+                } else if state.source == nil {
+                    HomeView(showPhotoPicker: $showPhotoPicker, showFiles: $showFiles,
+                             onPaste: { Task { await state.pasteImage() } }, onBatch: addToBatch)
                         .transition(.asymmetric(insertion: .opacity,
                                                 removal: .opacity.combined(with: .scale(scale: 0.94))))
                 } else {
@@ -226,14 +234,27 @@ struct ContentView: View {
                 }
             }
             .animation(Theme.spring, value: state.source == nil)
+            .animation(Theme.spring, value: state.batch == nil)
             .animation(Theme.spring, value: state.isLoading)
             .animation(Theme.spring, value: state.toast)
+            .photosPicker(isPresented: $showBatchPicker, selection: $batchPicks,
+                          maxSelectionCount: 40, matching: .images)
+            .onChange(of: batchPicks) { _, picks in
+                guard !picks.isEmpty else { return }
+                state.addBatch(photos: picks)
+                batchPicks = []
+            }
             .navigationTitle("")
             .cleanTopBar()
             .toolbar { toolbarContent }
             .dropDestination(for: URL.self) { urls, _ in
                 guard let url = urls.first, !state.isRunning else { return false }
-                Task { await state.load(fileURL: url) }
+                // Several images dropped at once (or anything dropped on the batch list) make a batch.
+                if state.batch != nil || (urls.count > 1 && state.source == nil) {
+                    state.addBatch(files: urls)
+                } else {
+                    Task { await state.load(fileURL: url) }
+                }
                 return true
             }
             .alert(exitPrompt == .running ? "Stop and exit?" : "Exit without saving?",
@@ -404,6 +425,15 @@ struct ContentView: View {
             }
     }
 
+    /// Batch: choose more images (Finder on the Mac, the photo library on iPhone and iPad).
+    private func addToBatch() {
+        #if os(macOS)
+        state.pickBatchFiles()
+        #else
+        showBatchPicker = true
+        #endif
+    }
+
     /// Asks before leaving when that would stop a run or discard an unsaved result.
     private func requestExit() {
         if state.isRunning {
@@ -420,16 +450,16 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .leadingBar) {
-            if state.source != nil {
+            if state.source != nil || state.batch != nil {
                 Button { requestExit() } label: {
                     Image(systemName: "xmark")
                 }
-                .accessibilityLabel("Close image")
+                .accessibilityLabel(state.batch != nil ? "Close batch" : "Close image")
             }
         }
         #if os(iOS)
         ToolbarItem(placement: .principal) {
-            if state.source != nil {
+            if state.source != nil || state.batch != nil {
                 HStack(spacing: 6) {
                     Image(systemName: "sparkles")
                         .foregroundStyle(Theme.accent)
@@ -454,6 +484,10 @@ struct ContentView: View {
                     Button { showFiles = true } label: { Label("Browse Files", systemImage: "folder") }
                         .keyboardShortcut("o")
                     #endif
+                    Button { Task { await state.pasteImage() } } label: {
+                        Label("Paste Image", systemImage: "doc.on.clipboard")
+                    }
+                    .keyboardShortcut("v")
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -475,6 +509,10 @@ struct ContentView: View {
                         Label("Add to Photos Library", systemImage: "photo.on.rectangle")
                     }
                     #endif
+                    Button { state.copyResult() } label: {
+                        Label("Copy Image", systemImage: "doc.on.doc")
+                    }
+                    .keyboardShortcut("c")
                 } label: {
                     if state.isExporting {
                         ProgressView()
@@ -503,6 +541,8 @@ struct ContentView: View {
 struct HomeView: View {
     @Binding var showPhotoPicker: Bool
     @Binding var showFiles: Bool
+    var onPaste: () -> Void = {}
+    var onBatch: () -> Void = {}
     @State private var appeared = false
     @State private var floating = false
     @State private var glow = false
@@ -619,6 +659,14 @@ struct HomeView: View {
                 }
                 .buttonStyle(PressableStyle())
                 .stagger(appeared, 7)
+
+                HStack(spacing: 10) {
+                    smallButton("Paste", symbol: "doc.on.clipboard", action: onPaste)
+                        .keyboardShortcut("v")
+                    smallButton("Batch", symbol: "photo.stack", action: onBatch)
+                        .keyboardShortcut("b")
+                }
+                .stagger(appeared, 8)
             }
             .padding(.horizontal, 24)
             .padding(.bottom, 26)
@@ -648,6 +696,20 @@ struct HomeView: View {
             withAnimation(.easeInOut(duration: 2.4).repeatForever(autoreverses: true)) { glow = true }
         }
         .onDisappear { appeared = false }
+    }
+
+    private func smallButton(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: symbol)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.85))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 11)
+                .background(Capsule().fill(Color.white.opacity(0.07)))
+                .overlay(Capsule().strokeBorder(Color.white.opacity(0.1), lineWidth: 1))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(PressableStyle())
     }
 }
 
@@ -748,9 +810,18 @@ struct ControlsPanel: View {
     /// iPhone: show a pill that tucks the controls away with a swipe down.
     var collapsible = false
     var collapsed: Binding<Bool> = .constant(false)
+    /// Batch mode: the same controls, applied to every image in the batch.
+    var batch = false
     @Namespace private var chips
     @GestureState private var drag: CGFloat = 0
     @State private var tab: AdjustTab = .finish
+    @State private var showCustomSize = false
+    @State private var customSize = ""
+
+    /// Common screen sizes for "Fit to" (name, long side in pixels).
+    private static let fitChoices: [(String, Int)] = [
+        ("Full HD", 1920), ("2K", 2560), ("4K", 3840), ("5K", 5120), ("8K", 7680),
+    ]
 
     enum AdjustTab: Hashable { case finish, enhance }
 
@@ -788,6 +859,62 @@ struct ControlsPanel: View {
         .animation(Theme.spring, value: state.result != nil)
         .animation(Theme.spring, value: isCollapsed)
         .sensoryFeedback(.impact(weight: .light), trigger: isCollapsed)
+        .alert("Custom size", isPresented: $showCustomSize) {
+            TextField("Long side in pixels", text: $customSize)
+                #if os(iOS)
+                .keyboardType(.numberPad)
+                #endif
+            Button("Set") {
+                if let px = Int(customSize.trimmingCharacters(in: .whitespaces)), px >= 16 {
+                    state.fit(longSide: min(px, AIUpscaler.maxSide))
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("How many pixels should the longer side of the result be? Texel can enlarge up to 8×.")
+        }
+    }
+
+    /// Dims the manual settings while Auto Fix is choosing them for each batch image.
+    private var autoOwnsSettings: Bool { batch && state.batchAuto }
+
+    /// "Fit to": aim for a size in pixels instead of a plain 2×, 4×…
+    private var fitMenu: some View {
+        Menu {
+            Section("Fit the long side to") {
+                ForEach(Self.fitChoices.indices, id: \.self) { i in
+                    let choice = Self.fitChoices[i]
+                    Button {
+                        state.fit(longSide: choice.1)
+                    } label: {
+                        if state.fitTarget == choice.1 {
+                            Label("\(choice.0) · \(String(choice.1)) px", systemImage: "checkmark")
+                        } else {
+                            Text("\(choice.0) · \(String(choice.1)) px")
+                        }
+                    }
+                }
+            }
+            Button("Custom Size…") {
+                customSize = state.fitTarget.map { String($0) } ?? ""
+                showCustomSize = true
+            }
+        } label: {
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.footnote.weight(.bold))
+                .frame(width: 36, height: 36)
+                .contentShape(Circle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .foregroundStyle(state.fitTarget != nil ? Color.white : Color.white.opacity(0.6))
+        .frame(width: 36, height: 36)
+        .background(
+            Circle().fill(state.fitTarget != nil ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Color.white.opacity(0.07)))
+        )
+        .accessibilityLabel("Fit to a size")
+        .help("Fit to a size: 4K, custom…")
     }
 
     private var dragOffset: CGFloat {
@@ -850,19 +977,47 @@ struct ControlsPanel: View {
 
     private var fullControls: some View {
         VStack(spacing: 14) {
-            AutoFixButton(state: state)
-
-            row("Size") {
-                PillPicker(options: [
-                    .init(value: 1.0, title: "1×"),
-                    .init(value: 2.0, title: "2×"),
-                    .init(value: 3.0, title: "3×"),
-                    .init(value: 4.0, title: "4×"),
-                    .init(value: 6.0, title: "6×"),
-                    .init(value: 8.0, title: "8×"),
-                ], selection: $state.scale)
+            if batch {
+                BatchAutoToggle(state: state)
+            } else {
+                AutoFixButton(state: state)
             }
 
+            row("Size") {
+                HStack(spacing: 6) {
+                    // No pill is lit while "Fit to" is choosing the size.
+                    PillPicker(options: [
+                        .init(value: 1.0, title: "1×"),
+                        .init(value: 2.0, title: "2×"),
+                        .init(value: 3.0, title: "3×"),
+                        .init(value: 4.0, title: "4×"),
+                        .init(value: 6.0, title: "6×"),
+                        .init(value: 8.0, title: "8×"),
+                    ], selection: Binding(get: { state.fitTarget == nil ? state.scale : -1 },
+                                          set: { state.setScale($0) }))
+                    .opacity(autoOwnsSettings ? 0.35 : 1)
+                    .allowsHitTesting(!autoOwnsSettings)
+                    fitMenu
+                }
+            }
+
+            manualSettings
+                .opacity(autoOwnsSettings ? 0.35 : 1)
+                .allowsHitTesting(!autoOwnsSettings)
+
+            statusLine
+
+            if batch {
+                BatchStartButton(state: state)
+            } else {
+                UpscaleButton(state: state)
+            }
+        }
+    }
+
+    /// Mode, model and the Finish / Enhance sliders.
+    private var manualSettings: some View {
+        VStack(spacing: 14) {
             row("Mode") {
                 PillPicker(options: [
                     .init(value: true, title: "AI", symbol: "sparkles"),
@@ -918,10 +1073,6 @@ struct ControlsPanel: View {
             }
             .animation(Theme.spring, value: state.useAI)
             .animation(Theme.snappy, value: tab)
-
-            statusLine
-
-            UpscaleButton(state: state)
         }
     }
 
@@ -1009,7 +1160,20 @@ struct ControlsPanel: View {
 
     @ViewBuilder
     private var statusLine: some View {
-        if let blocker = state.blocker {
+        if batch, let blocker = state.batchBlocker {
+            Label(blocker, systemImage: "exclamationmark.triangle.fill")
+                .font(.footnote)
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .transition(.opacity)
+        } else if autoOwnsSettings {
+            Text("Auto Fix looks at each image and picks the model and sliders for it. It keeps the size, or doubles small images, unless you pick a Fit to size.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .lineLimit(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .transition(.opacity)
+        } else if let blocker = state.blocker {
             Label(blocker, systemImage: "exclamationmark.triangle.fill")
                 .font(.footnote)
                 .foregroundStyle(.orange)
@@ -1251,7 +1415,7 @@ struct RunCard: View {
                 .frame(width: 64, height: 64)
 
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(state.useAI ? "Upscaling with AI" : "Upscaling")
+                    Text(title)
                         .font(.headline)
                     Text(state.stage)
                         .font(.footnote)
@@ -1260,7 +1424,8 @@ struct RunCard: View {
                         .contentTransition(.opacity)
                         .animation(.easeInOut(duration: 0.2), value: state.stage)
                     TimelineView(.periodic(from: state.startedAt, by: 0.1)) { ctx in
-                        Text(String(format: "%.1f s", ctx.date.timeIntervalSince(state.startedAt)))
+                        Text(RunCard.timeText(elapsed: ctx.date.timeIntervalSince(state.startedAt),
+                                              progress: state.progress))
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
@@ -1301,6 +1466,327 @@ struct RunCard: View {
         .onAppear {
             withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) { spin = true }
         }
+    }
+
+    private var title: String {
+        if state.batch != nil { return "Upscaling the batch" }
+        if !state.useAI { return "Upscaling" }
+        return state.scale == 1 ? "Enhancing with AI" : "Upscaling with AI"
+    }
+
+    /// "12.4 s · about 40 s left": the estimate appears once there's enough progress to judge by.
+    static func timeText(elapsed: TimeInterval, progress: Double) -> String {
+        let e = max(0, elapsed)
+        var text = e < 60 ? String(format: "%.1f s", e) : clock(e)
+        if progress > 0.04, progress < 0.995, e > 3 {
+            let left = e / progress * (1 - progress)
+            let about: String
+            if left < 10 {
+                about = "\(max(1, Int(left.rounded(.up)))) s"
+            } else if left < 60 {
+                about = "\(Int((left / 5).rounded(.up)) * 5) s"
+            } else {
+                about = clock((left / 15).rounded(.up) * 15) + " min"
+            }
+            text += " · about \(about) left"
+        }
+        return text
+    }
+
+    private static func clock(_ t: TimeInterval) -> String {
+        let s = Int(t.rounded())
+        return "\(s / 60):" + String(format: "%02d", s % 60)
+    }
+}
+
+// MARK: - Batch
+
+/// Several images at once: the list sits where the photo would be, with the usual controls beside it.
+struct BatchView: View {
+    @ObservedObject var state: AppState
+    var onAdd: () -> Void
+    var onExit: () -> Void
+
+    var body: some View {
+        GeometryReader { geo in
+            if geo.size.width > 760 {
+                HStack(alignment: .center, spacing: 0) {
+                    ScrollView {
+                        list.padding(EdgeInsets(top: 12, leading: 16, bottom: 16, trailing: 10))
+                    }
+                    side(edge: .trailing)
+                        .frame(width: 380)
+                        .padding(EdgeInsets(top: 12, leading: 4, bottom: 16, trailing: 16))
+                }
+            } else {
+                ScrollView {
+                    VStack(spacing: 14) {
+                        list
+                        side(edge: .bottom)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 10)
+                }
+            }
+        }
+    }
+
+    private func side(edge: Edge) -> some View {
+        ZStack {
+            if state.isRunning {
+                RunCard(state: state, onStartOver: onExit)
+                    .transition(.move(edge: edge).combined(with: .opacity))
+            } else {
+                ControlsPanel(state: state, batch: true)
+                    .transition(.move(edge: edge).combined(with: .opacity))
+            }
+        }
+        .animation(Theme.spring, value: state.isRunning)
+    }
+
+    private var list: some View {
+        let items = state.batch ?? []
+        return VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Batch").font(.title2.weight(.bold))
+                    Text(summary(items))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(action: onAdd) {
+                    Label("Add", systemImage: "plus")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(Capsule().fill(Color.white.opacity(0.1)))
+                        .overlay(Capsule().strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(PressableStyle())
+                .disabled(state.isRunning)
+                .opacity(state.isRunning ? 0.4 : 1)
+            }
+            .padding(.bottom, 2)
+
+            if items.isEmpty {
+                Text("Add some images to get going.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 40)
+            }
+            ForEach(items) { item in
+                row(item)
+            }
+            #if os(macOS)
+            destination
+            #endif
+        }
+    }
+
+    private func summary(_ items: [BatchItem]) -> String {
+        let done = items.filter { $0.isDone }.count
+        let total = items.count == 1 ? "1 image" : "\(items.count) images"
+        return done > 0 ? "\(done) of \(total) done" : total
+    }
+
+    private func row(_ item: BatchItem) -> some View {
+        HStack(spacing: 12) {
+            statusIcon(item.status)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(statusText(item.status))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+            if !state.isRunning {
+                Button {
+                    withAnimation(Theme.snappy) { state.removeBatchItem(item.id) }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .padding(8)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Remove \(item.name)")
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.white.opacity(0.06)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.white.opacity(item.status == .running ? 0.4 : 0.08), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func statusIcon(_ status: BatchItem.Status) -> some View {
+        switch status {
+        case .waiting:
+            Image(systemName: "circle").foregroundStyle(.tertiary)
+        case .running:
+            ProgressView().controlSize(.small)
+        case .done:
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        }
+    }
+
+    private func statusText(_ status: BatchItem.Status) -> String {
+        switch status {
+        case .waiting: return "Waiting"
+        case .running: return "Working on it…"
+        case .done(let savedAs): return savedAs
+        case .failed(let why): return why
+        }
+    }
+
+    #if os(macOS)
+    /// Where the results go and in which format.
+    private var destination: some View {
+        let folder = state.batchOutputFolder
+        return VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "folder")
+                    .foregroundStyle(.secondary)
+                Text("Saves to \(folder.deletingLastPathComponent().lastPathComponent) › \(folder.lastPathComponent)")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                Button("Show") { state.showBatchFolder() }
+                Button("Change…") { state.chooseBatchFolder() }
+                    .disabled(state.isRunning)
+            }
+            .font(.footnote)
+            PillPicker(options: [
+                .init(value: ExportFormat.png, title: "PNG"),
+                .init(value: ExportFormat.jpeg, title: "JPEG"),
+                .init(value: ExportFormat.heic, title: "HEIC"),
+            ], selection: $state.batchFormat, compact: true)
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.white.opacity(0.06)))
+        .padding(.top, 4)
+    }
+    #endif
+}
+
+/// Batch: let Auto Fix choose the settings for each image.
+struct BatchAutoToggle: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        Button {
+            withAnimation(Theme.snappy) { state.batchAuto.toggle() }
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "wand.and.stars")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Theme.gold)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Auto Fix each image")
+                        .font(.subheadline.weight(.bold))
+                    Text(state.batchAuto ? "On: Texel picks the settings for each one"
+                                         : "Off: every image gets the settings below")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: state.batchAuto ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(state.batchAuto ? Theme.gold : Color.white.opacity(0.4))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Theme.gold.opacity(state.batchAuto ? 0.18 : 0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Theme.gold.opacity(state.batchAuto ? 0.7 : 0.3), lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        }
+        .buttonStyle(PressableStyle())
+        .sensoryFeedback(.selection, trigger: state.batchAuto)
+        .accessibilityValue(state.batchAuto ? "On" : "Off")
+    }
+}
+
+/// Batch: starts (or continues) upscaling everything that isn't done yet.
+struct BatchStartButton: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        let items = state.batch ?? []
+        let left = items.filter { !$0.isDone }.count
+        let disabled = state.isRunning || left == 0 || state.batchBlocker != nil
+        Button {
+            state.runBatch()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkles")
+                    .font(.headline)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title(left: left, total: items.count))
+                        .font(.headline)
+                    Text(subtitle)
+                        .font(.caption2.weight(.semibold))
+                        .opacity(0.8)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Image(systemName: "arrow.right")
+                    .font(.headline)
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+            .background(Capsule().fill(Theme.accent))
+            .shine(!disabled)
+            .shadow(color: Theme.indigo.opacity(disabled ? 0 : 0.5), radius: 16, y: 8)
+            .opacity(disabled ? 0.45 : 1)
+        }
+        .buttonStyle(PressableStyle())
+        .keyboardShortcut(.return, modifiers: .command)
+        .disabled(disabled)
+        .sensoryFeedback(.impact(weight: .medium), trigger: state.isRunning) { _, running in running }
+    }
+
+    private func title(left: Int, total: Int) -> String {
+        if total == 0 { return "Add images to start" }
+        if left == 0 { return "All done" }
+        return left == 1 ? "Upscale 1 Image" : "Upscale \(left) Images"
+    }
+
+    private var subtitle: String {
+        var parts: [String] = []
+        if let fit = state.fitTarget {
+            parts.append("Long side → \(String(fit)) px")
+        } else if state.batchAuto {
+            parts.append("Size picked per image")
+        } else {
+            parts.append(state.scale == 1 ? "Same size" : "\(scaleText(state.scale)) each")
+        }
+        #if os(macOS)
+        parts.append("\(state.batchFormat.rawValue) → \(state.batchOutputFolder.lastPathComponent)")
+        #else
+        parts.append("Saves to Photos")
+        #endif
+        return parts.joined(separator: " · ")
     }
 }
 

@@ -1,10 +1,10 @@
 # Texel for Windows
 
-The Windows version of Texel, built with Electron. It has the same interface and features as the Mac and iPhone apps: AI upscaling (1× to 8×), Auto Fix, the Finish and Enhance sliders, face restoration, colour and light, Classic mode and the before/after compare view.
+The Windows version of Texel, built with Electron. It has the same interface and features as the Mac and iPhone apps: AI upscaling (1× to 8×, or fitted to a size such as 4K), Auto Fix, batch upscaling, the Finish and Enhance sliders, face restoration, colour and light, Classic mode, copy and paste, and the before/after compare view.
 
 ## Run it
 
-Download `Texel-Windows-1.0.0.zip`, unzip it anywhere, and double-click **Texel.exe**. Nothing needs installing.
+Download `Texel-Windows-0.2.zip`, unzip it anywhere, and double-click **Texel.exe**. Nothing needs installing.
 
 Windows may show "Windows protected your PC" the first time, because the app isn't signed with a Windows code-signing certificate. Click **More info**, then **Run anyway**.
 

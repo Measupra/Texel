@@ -41,7 +41,10 @@
       <div class="spacer grow"></div>
       <div class="home-buttons">
         <button class="btn-primary st" style="--i:6" id="btnOpen"></button>
-        <button class="btn-secondary st" style="--i:7" id="btnPaste"></button>
+        <div class="home-row st" style="--i:7">
+          <button class="btn-secondary" id="btnPaste"></button>
+          <button class="btn-secondary" id="btnBatch"></button>
+        </div>
         <p class="hint st" style="--i:8">or drop an image anywhere</p>
       </div>
     </div>
@@ -50,6 +53,7 @@
   <section class="editor" id="editor" hidden>
     <div class="stage" id="stage">
       <canvas id="view"></canvas>
+      <div class="batch" id="batch" hidden></div>
       <div class="knob" id="knob" hidden></div>
       <div class="scan" id="scan" hidden><div class="band"></div></div>
       <div class="labels">
@@ -69,6 +73,7 @@
 <div class="loading glass" id="loading" hidden><div class="spinner"></div><span>Opening image…</span></div>
 <div class="menu glass" id="saveMenu" hidden></div>
 <div class="menu glass" id="addMenu" hidden></div>
+<div class="menu glass" id="fitMenu" hidden></div>
 <div class="drop" id="drop" hidden><div><span id="dropIcon"></span>Drop to open</div></div>
 <div class="modal" id="modal" hidden><div class="dialog glass" id="dialog" role="dialog" aria-modal="true"></div></div>
 

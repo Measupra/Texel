@@ -3,6 +3,7 @@ import PhotosUI
 import Photos
 import UniformTypeIdentifiers
 import Accelerate
+import Combine
 #if os(macOS)
 import AppKit
 #endif
@@ -12,11 +13,49 @@ struct ShareItem: Identifiable {
     let url: URL
 }
 
+/// One image in a batch.
+struct BatchItem: Identifiable {
+    enum Status: Equatable { case waiting, running, done(String), failed(String) }
+    enum Input { case file(URL), photo(PhotosPickerItem) }
+
+    let id = UUID()
+    let name: String
+    let input: Input
+    var status: Status = .waiting
+
+    var isDone: Bool {
+        if case .done = status { return true }
+        return false
+    }
+}
+
+enum BatchError: LocalizedError {
+    case tooLarge(Int, Int)
+    case needsAI
+
+    var errorDescription: String? {
+        switch self {
+        case .tooLarge(let w, let h): return "\(w) × \(h) is too large. Pick a smaller size."
+        case .needsAI: return "Already this size. Keeping the size needs AI mode."
+        }
+    }
+}
+
 @MainActor
 final class AppState: ObservableObject {
     @Published var source: SourceImage?
     @Published var result: CGImage?
     @Published var scale: Double = 2
+    /// "Fit to": the long side to aim for, in pixels. While set, `scale` is worked out from it
+    /// for each image (nil = a plain 1×–8× scale).
+    @Published var fitTarget: Int?
+    /// Batch: the images queued up (nil = not in batch mode).
+    @Published var batch: [BatchItem]?
+    /// Batch: let Auto Fix choose the settings for each image.
+    @Published var batchAuto = false
+    /// Batch on the Mac: file format, and where results go (nil = Downloads › Texel).
+    @Published var batchFormat: ExportFormat = .png
+    @Published var batchFolder: URL?
     @Published var useAI = true
     @Published var aiModel: AIModel = .photo
     @Published var preset: Preset = .best
@@ -68,6 +107,7 @@ final class AppState: ObservableObject {
     /// Bumped by each run and by goHome(), so a finished or cancelled run never touches a newer state.
     private var runID = 0
     private var cancelFlag = CancelFlag()
+    private var settingsSaver: AnyCancellable?
     #if os(iOS)
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     /// Classic mode keeps several full-size GPU buffers, so it gets a lower limit on a phone.
@@ -86,10 +126,92 @@ final class AppState: ObservableObject {
     }
 
     init() {
+        loadSettings()
+        // Remember the settings: save them shortly after anything changes.
+        settingsSaver = objectWillChange
+            .debounce(for: .seconds(0.6), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in self?.saveSettings() }
+            }
         Task.detached(priority: .utility) {
             if let e = try? Engine() {
                 await MainActor.run { self.engine = e }
             }
+        }
+    }
+
+    // MARK: remembered settings
+
+    private func loadSettings() {
+        let d = UserDefaults.standard
+        guard d.bool(forKey: "settings.saved") else { return }
+        let s = d.double(forKey: "scale")
+        if [1, 2, 3, 4, 6, 8].contains(s) { scale = s }
+        let fit = d.integer(forKey: "fitTarget")
+        fitTarget = fit >= 16 ? fit : nil
+        useAI = d.bool(forKey: "useAI")
+        if let m = d.string(forKey: "aiModel").flatMap(AIModel.init(rawValue:)) { aiModel = m }
+        if let p = d.string(forKey: "preset").flatMap(Preset.init(rawValue:)), p != .custom { preset = p }
+        func unit(_ key: String, _ fallback: Double) -> Double {
+            d.object(forKey: key) == nil ? fallback : min(1, max(0, d.double(forKey: key)))
+        }
+        aiStrength = unit("aiStrength", 1)
+        detail = unit("detail", 0.35)
+        sharpen = unit("sharpen", 0.25)
+        smooth = unit("smooth", 0.35)
+        restoreFaces = d.bool(forKey: "restoreFaces")
+        faceStrength = unit("faceStrength", 0.7)
+        autoEnhance = d.bool(forKey: "autoEnhance")
+        enhanceAmount = unit("enhanceAmount", 0.6)
+        batchAuto = d.bool(forKey: "batchAuto")
+        if let f = d.string(forKey: "batchFormat").flatMap(ExportFormat.init(rawValue:)) { batchFormat = f }
+    }
+
+    private func saveSettings() {
+        let d = UserDefaults.standard
+        d.set(true, forKey: "settings.saved")
+        // A scale worked out for one image by "Fit to" isn't a setting; the target is.
+        if fitTarget == nil { d.set(scale, forKey: "scale") }
+        d.set(fitTarget ?? 0, forKey: "fitTarget")
+        d.set(useAI, forKey: "useAI")
+        d.set(aiModel.rawValue, forKey: "aiModel")
+        d.set(preset.rawValue, forKey: "preset")
+        d.set(aiStrength, forKey: "aiStrength")
+        d.set(detail, forKey: "detail")
+        d.set(sharpen, forKey: "sharpen")
+        d.set(smooth, forKey: "smooth")
+        d.set(restoreFaces, forKey: "restoreFaces")
+        d.set(faceStrength, forKey: "faceStrength")
+        d.set(autoEnhance, forKey: "autoEnhance")
+        d.set(enhanceAmount, forKey: "enhanceAmount")
+        d.set(batchAuto, forKey: "batchAuto")
+        d.set(batchFormat.rawValue, forKey: "batchFormat")
+    }
+
+    // MARK: size
+
+    /// Picks a plain scale (1×–8×).
+    func setScale(_ value: Double) {
+        fitTarget = nil
+        scale = value
+    }
+
+    /// "Fit to": make the long side of the result `target` pixels.
+    func fit(longSide target: Int) {
+        fitTarget = target
+        applyFit(announce: true)
+    }
+
+    /// Works out `scale` for the open image from `fitTarget`.
+    private func applyFit(announce: Bool) {
+        guard let target = fitTarget, let s = source else { return }
+        let k = Double(target) / Double(max(s.width, s.height))
+        scale = min(8, max(1, k))
+        guard announce else { return }
+        if k < 1 {
+            showToast("This image is already bigger than \(target) px, so it keeps its size", icon: "info.circle.fill")
+        } else if k > 8 {
+            showToast("8× is the most Texel can enlarge, so it stops there", icon: "info.circle.fill")
         }
     }
 
@@ -163,6 +285,24 @@ final class AppState: ObservableObject {
                                height: loaded.height, colorSpace: loaded.colorSpace,
                                hasAlpha: loaded.hasAlpha, pixels: loaded.pixels)
         }.value
+        show(img)
+    }
+
+    /// Opens an image that didn't come from a file (pasted from the clipboard).
+    func load(image: CGImage, name: String) async {
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            let img = try await Task.detached(priority: .userInitiated) { () throws -> SourceImage in
+                try ImageFiles.make(from: image, name: name, url: nil)
+            }.value
+            show(img)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func show(_ img: SourceImage) {
         source = img
         result = nil
         base = nil
@@ -172,6 +312,62 @@ final class AppState: ObservableObject {
         resultLabel = ""
         viewMode = .split
         split = 0.5
+        isSaved = false
+        applyFit(announce: false)
+    }
+
+    // MARK: clipboard
+
+    /// Opens the image on the clipboard.
+    func pasteImage() async {
+        guard !isRunning, batch == nil else { return }
+        #if os(macOS)
+        let pb = NSPasteboard.general
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [
+            .urlReadingFileURLsOnly: true,
+            .urlReadingContentsConformToTypes: [UTType.image.identifier],
+        ]
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: options) as? [URL], let url = urls.first {
+            await load(fileURL: url)
+            return
+        }
+        if let image = NSImage(pasteboard: pb) {
+            // Prefer the full-resolution bitmap (a Retina screenshot has twice the pixels of its size).
+            let reps = image.representations.compactMap { $0 as? NSBitmapImageRep }
+            let best = reps.max { $0.pixelsWide < $1.pixelsWide }
+            if let cg = best?.cgImage ?? image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                await load(image: cg, name: "Pasted image.png")
+                return
+            }
+        }
+        #else
+        if UIPasteboard.general.hasImages, let image = UIPasteboard.general.image {
+            // Redraw it upright: a pasted photo can carry a rotation flag.
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = image.scale
+            let upright = UIGraphicsImageRenderer(size: image.size, format: format).image { _ in
+                image.draw(in: CGRect(origin: .zero, size: image.size))
+            }
+            if let cg = upright.cgImage {
+                await load(image: cg, name: "Pasted image.png")
+                return
+            }
+        }
+        #endif
+        showToast("There's no image on the clipboard", icon: "info.circle.fill")
+    }
+
+    /// Copies the result to the clipboard.
+    func copyResult() {
+        guard let image = result, !isRunning else { return }
+        #if os(macOS)
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.writeObjects([NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))])
+        #else
+        UIPasteboard.general.image = UIImage(cgImage: image)
+        #endif
+        showToast("Copied")
     }
 
     // MARK: running
@@ -292,6 +488,7 @@ final class AppState: ObservableObject {
                 guard self.source?.cgImage === src.cgImage else { return }
                 self.useAI = true
                 self.aiModel = plan.model
+                self.fitTarget = nil
                 self.scale = plan.scale
                 self.aiStrength = plan.strength
                 self.detail = plan.detail
@@ -339,6 +536,7 @@ final class AppState: ObservableObject {
             finish()
         }
         runID += 1
+        clearBatch()
         source = nil
         result = nil
         base = nil
@@ -364,6 +562,312 @@ final class AppState: ObservableObject {
             backgroundTask = .invalid
         }
         #endif
+    }
+
+    // MARK: batch
+
+    /// Where batch results go on the Mac.
+    var batchOutputFolder: URL {
+        if let batchFolder { return batchFolder }
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return downloads.appendingPathComponent("Texel", isDirectory: true)
+    }
+
+    /// A reason the batch can't start with the current settings, if there is one.
+    var batchBlocker: String? {
+        if batchAuto { return nil }
+        if useAI { return ai.isAvailable(aiModel) ? nil : "This AI model is missing from the app." }
+        if scale == 1 && fitTarget == nil { return "1× (enhance without enlarging) needs AI mode." }
+        if engine == nil { return "The GPU is still getting ready." }
+        return nil
+    }
+
+    /// Adds image files to the batch (starting one if needed). Each is copied first, so it stays
+    /// readable however it reached the app (dropped, picked or pasted).
+    func addBatch(files urls: [URL]) {
+        guard !isRunning, source == nil else { return }
+        var items: [BatchItem] = []
+        for url in urls {
+            guard UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true else { continue }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            let copy = FileManager.default.temporaryDirectory
+                .appendingPathComponent("batch-\(UUID().uuidString)-\(url.lastPathComponent)")
+            if (try? FileManager.default.copyItem(at: url, to: copy)) != nil {
+                items.append(BatchItem(name: url.lastPathComponent, input: .file(copy)))
+            }
+        }
+        if items.isEmpty {
+            showToast("Those aren't images Texel can open", icon: "info.circle.fill")
+        } else {
+            batch = (batch ?? []) + items
+        }
+    }
+
+    /// Adds photos from the library to the batch.
+    func addBatch(photos: [PhotosPickerItem]) {
+        guard !isRunning, source == nil, !photos.isEmpty else { return }
+        let start = batch?.count ?? 0
+        let items = photos.enumerated().map { n, photo in
+            BatchItem(name: "Photo \(start + n + 1)", input: .photo(photo))
+        }
+        batch = (batch ?? []) + items
+    }
+
+    func removeBatchItem(_ id: UUID) {
+        guard !isRunning else { return }
+        batch?.removeAll { $0.id == id }
+    }
+
+    private func clearBatch() {
+        for item in batch ?? [] {
+            if case .file(let url) = item.input { try? FileManager.default.removeItem(at: url) }
+        }
+        batch = nil
+    }
+
+    #if os(macOS)
+    func pickBatchFiles() {
+        guard !isRunning else { return }
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.image]
+        panel.message = "Choose the images to upscale"
+        panel.prompt = "Add"
+        panel.begin { response in
+            guard response == .OK else { return }
+            let urls = panel.urls
+            Task { @MainActor in self.addBatch(files: urls) }
+        }
+    }
+
+    func chooseBatchFolder() {
+        guard !isRunning else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.message = "Choose where Texel saves the upscaled images"
+        panel.prompt = "Save Here"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in self.batchFolder = url }
+        }
+    }
+
+    func showBatchFolder() {
+        let folder = batchOutputFolder
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(folder)
+    }
+    #endif
+
+    /// Upscales every image in the batch that isn't done yet, one after another, with the current
+    /// settings (or Auto Fix for each). Mac: saves into the batch folder. iPhone: saves to Photos.
+    func runBatch() {
+        guard let items = batch, !isRunning else { return }
+        let todo = items.indices.filter { !items[$0].isDone }
+        guard !todo.isEmpty else { return }
+
+        let ai = self.ai, engine = self.engine, restorer = faceRestorer
+        let auto = batchAuto, fit = fitTarget
+        let baseScale = scale, baseUseAI = useAI, baseModel = aiModel, basePreset = preset
+        let baseLook = currentLook
+        let aiMaxSide = AIUpscaler.maxSide, aiMaxPixels = AIUpscaler.maxOutputPixels
+        let classicMax = AppState.classicMaxPixels
+        #if os(macOS)
+        let folder = batchOutputFolder, format = batchFormat
+        #endif
+
+        let flag = CancelFlag()
+        cancelFlag = flag
+        runID += 1
+        let id = runID
+        isRunning = true
+        progress = 0
+        stage = "Starting…"
+        startedAt = Date()
+        #if os(iOS)
+        UIApplication.shared.isIdleTimerDisabled = true
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Batch") { flag.set() }
+        #endif
+
+        Task.detached(priority: .userInitiated) {
+            // Make sure there's somewhere to save before doing any work.
+            #if os(macOS)
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            } catch {
+                await MainActor.run {
+                    guard self.runID == id else { return }
+                    self.finish()
+                    self.errorMessage = "Texel can't save into \(folder.lastPathComponent). Choose another folder."
+                }
+                return
+            }
+            #else
+            let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+            guard status == .authorized || status == .limited else {
+                await MainActor.run {
+                    guard self.runID == id else { return }
+                    self.finish()
+                    self.errorMessage = "Texel can't add to your library. Allow it in Settings › Privacy & Security › Photos › Texel."
+                }
+                return
+            }
+            #endif
+
+            var saved = 0
+            for (n, index) in todo.enumerated() {
+                if flag.isSet { break }
+                let item = items[index]
+                let prefix = "\(n + 1) of \(todo.count)"
+                let position = Double(n), count = Double(todo.count)
+                await MainActor.run {
+                    guard self.runID == id else { return }
+                    self.batch?[index].status = .running
+                    self.stage = "\(prefix) · Opening"
+                }
+                let report: (EngineProgress) -> Void = { p in
+                    Task { @MainActor in
+                        guard self.isRunning, self.runID == id else { return }
+                        self.progress = (position + p.fraction) / count
+                        self.stage = "\(prefix) · \(p.stage)"
+                    }
+                }
+                var temporary: URL?
+                do {
+                    // 1. Open it.
+                    let src: SourceImage
+                    switch item.input {
+                    case .file(let url):
+                        src = try ImageFiles.load(url: url)
+                    case .photo(let photo):
+                        guard let data = try await photo.loadTransferable(type: Data.self) else {
+                            throw ImageFileError.unreadable(item.name)
+                        }
+                        let ext = photo.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"
+                        let tmp = FileManager.default.temporaryDirectory
+                            .appendingPathComponent("batch-\(UUID().uuidString).\(ext)")
+                        try data.write(to: tmp)
+                        temporary = tmp
+                        src = try ImageFiles.load(url: tmp)
+                    }
+
+                    // 2. Settings for this image.
+                    var itemScale = baseScale, itemUseAI = baseUseAI, itemModel = baseModel
+                    var look = baseLook
+                    if auto {
+                        report(EngineProgress(stage: "Looking for what to fix", fraction: 0))
+                        let plan = ImageAnalyzer.plan(for: ImageAnalyzer.analyze(src.cgImage),
+                                                      width: src.width, height: src.height)
+                        itemUseAI = true
+                        itemModel = plan.model
+                        itemScale = plan.scale
+                        look = Look(strength: plan.strength, detail: plan.detail, sharpen: plan.sharpen,
+                                    smooth: plan.smooth,
+                                    faces: plan.restoreFaces ? plan.faceStrength : 0,
+                                    enhance: plan.autoEnhance ? plan.enhanceAmount : 0)
+                    }
+                    if let fit {
+                        itemScale = min(8, max(1, Double(fit) / Double(max(src.width, src.height))))
+                    }
+                    let size = Engine.outputSize(width: src.width, height: src.height, scale: itemScale)
+                    let outW = size.0, outH = size.1
+                    if itemUseAI {
+                        guard outW <= aiMaxSide, outH <= aiMaxSide, outW * outH <= aiMaxPixels else {
+                            throw BatchError.tooLarge(outW, outH)
+                        }
+                    } else {
+                        guard itemScale > 1 else { throw BatchError.needsAI }
+                        guard outW * outH <= classicMax else { throw BatchError.tooLarge(outW, outH) }
+                    }
+
+                    // 3. Upscale, restore faces, finish.
+                    let resultBase: ResultBase
+                    if itemUseAI {
+                        let r = try ai.upscaleDetailed(src, model: itemModel, outW: outW, outH: outH,
+                                                       progress: report, isCancelled: { flag.isSet })
+                        resultBase = ResultBase(image: r.image, detailSource: r.detailSource, useFinisher: true)
+                    } else if let engine {
+                        var settings = UpscaleSettings()
+                        basePreset.apply(to: &settings)
+                        settings.scale = itemScale
+                        let image = try engine.upscale(src, settings: settings, progress: report,
+                                                       isCancelled: { flag.isSet })
+                        resultBase = ResultBase(image: image, detailSource: src.cgImage, useFinisher: false)
+                    } else {
+                        throw EngineError.noGPU
+                    }
+                    var restored: [RestoredFace] = []
+                    if look.faces > 0 && restorer.isAvailable {
+                        restored = (try? restorer.restore(resultBase.detailSource, progress: { s in
+                            report(EngineProgress(stage: s, fraction: 0.985))
+                        }, isCancelled: { flag.isSet })) ?? []
+                        if flag.isSet { throw EngineError.cancelled }
+                    }
+                    report(EngineProgress(stage: "Saving", fraction: 0.99))
+                    let image = Composer.compose(resultBase, faces: restored, look: look)
+
+                    // 4. Save.
+                    let stem = (item.name as NSString).deletingPathExtension
+                    let suffix = itemScale == 1 ? "enhanced"
+                        : scaleText(itemScale).replacingOccurrences(of: "×", with: "x")
+                    #if os(macOS)
+                    var url = folder.appendingPathComponent("\(stem)-texel-\(suffix).\(format.fileExtension)")
+                    var copyNumber = 2
+                    while FileManager.default.fileExists(atPath: url.path) {
+                        url = folder.appendingPathComponent("\(stem)-texel-\(suffix) \(copyNumber).\(format.fileExtension)")
+                        copyNumber += 1
+                    }
+                    try ImageFiles.save(image, to: url, format: format, quality: 0.92)
+                    let savedAs = url.lastPathComponent
+                    #else
+                    let dir = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("batch-out-\(UUID().uuidString)")
+                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                    let url = dir.appendingPathComponent("\(stem)-texel-\(suffix).heic")
+                    try ImageFiles.save(image, to: url, format: .heic, quality: 0.95)
+                    try await PHPhotoLibrary.shared().performChanges {
+                        let request = PHAssetCreationRequest.forAsset()
+                        request.addResource(with: .photo, fileURL: url, options: nil)
+                    }
+                    try? FileManager.default.removeItem(at: dir)
+                    let savedAs = "\(outW) × \(outH) · in Photos"
+                    #endif
+                    saved += 1
+                    await MainActor.run {
+                        guard self.runID == id else { return }
+                        self.batch?[index].status = .done(savedAs)
+                    }
+                } catch EngineError.cancelled {
+                    await MainActor.run {
+                        guard self.runID == id else { return }
+                        self.batch?[index].status = .waiting
+                    }
+                } catch {
+                    let message = error.localizedDescription
+                    await MainActor.run {
+                        guard self.runID == id else { return }
+                        self.batch?[index].status = .failed(message)
+                    }
+                }
+                if let temporary { try? FileManager.default.removeItem(at: temporary) }
+            }
+
+            let savedCount = saved, wasCancelled = flag.isSet
+            await MainActor.run {
+                guard self.runID == id else { return }
+                self.finish()
+                self.progress = 0
+                if !wasCancelled { self.completedRuns += 1 }
+                if savedCount > 0 {
+                    self.showToast(savedCount == 1 ? "Saved 1 image" : "Saved \(savedCount) images")
+                }
+            }
+        }
     }
 
     // MARK: finishing (detail, sharpen, smooth, Enhance)

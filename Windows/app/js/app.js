@@ -7,7 +7,8 @@ import { PRESETS, CLASSIC_MAX_PIXELS } from '../engine/classic.js';
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
-const scaleText = (s) => `${s}×`;
+const scaleText = (s) => `${+s.toFixed(2)}×`;
+const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 // ---------------------------------------------------------------- state
 
@@ -21,7 +22,60 @@ const S = {
   aiStrength: 1, detail: 0.35, sharpen: 0.25, smooth: 0.35,
   restoreFaces: true, faceStrength: 0.7, autoEnhance: true, enhanceAmount: 0.6,
   isSaved: false, autoSummary: null, tab: 'finish', hasBase: false,
+  fitTarget: null,       // "Fit to": the long side to aim for, in pixels (null = a plain 1×–8× scale)
+  batch: null,           // [{ id, name, read, status, note }] while in batch mode
+  batchAuto: false, batchFormat: 'png', batchFolder: '',
 };
+
+// ---------------------------------------------------------------- remembered settings
+
+const FORMATS = { png: ['image/png', 'png'], jpg: ['image/jpeg', 'jpg'], webp: ['image/webp', 'webp'] };
+const UNIT_KEYS = ['aiStrength', 'detail', 'sharpen', 'smooth', 'faceStrength', 'enhanceAmount'];
+const BOOL_KEYS = ['useAI', 'restoreFaces', 'autoEnhance', 'batchAuto'];
+
+function loadSettings() {
+  let d;
+  try { d = JSON.parse(localStorage.getItem('texel.settings') || 'null'); } catch { d = null; }
+  if (!d || typeof d !== 'object') return;
+  if ([1, 2, 3, 4, 6, 8].includes(d.scale)) S.scale = d.scale;
+  if (Number.isInteger(d.fitTarget) && d.fitTarget >= 16) S.fitTarget = d.fitTarget;
+  if (MODELS[d.aiModel]) S.aiModel = d.aiModel;
+  if (PRESETS[d.preset]) S.preset = d.preset;
+  if (FORMATS[d.batchFormat]) S.batchFormat = d.batchFormat;
+  for (const k of UNIT_KEYS) if (typeof d[k] === 'number' && d[k] >= 0 && d[k] <= 1) S[k] = d[k];
+  for (const k of BOOL_KEYS) if (typeof d[k] === 'boolean') S[k] = d[k];
+}
+let savedScale = 2, saveTimer = 0;
+function saveSettingsSoon() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    // A scale worked out for one image by "Fit to" isn't a setting; the target is.
+    if (!S.fitTarget) savedScale = S.scale;
+    const d = { scale: savedScale, fitTarget: S.fitTarget, aiModel: S.aiModel, preset: S.preset, batchFormat: S.batchFormat };
+    for (const k of [...UNIT_KEYS, ...BOOL_KEYS]) d[k] = S[k];
+    try { localStorage.setItem('texel.settings', JSON.stringify(d)); } catch { /* settings just won't persist */ }
+  }, 400);
+}
+loadSettings();
+savedScale = S.scale;
+
+// ---------------------------------------------------------------- size
+
+/** "Fit to": make the long side of the result `target` pixels. */
+function fit(target) {
+  S.fitTarget = target;
+  applyFit(true);
+  sync();
+}
+/** Works out the scale for the open image from the "Fit to" target. */
+function applyFit(announce) {
+  if (!S.fitTarget || !S.source) return;
+  const k = S.fitTarget / Math.max(S.source.w, S.source.h);
+  S.scale = Math.min(8, Math.max(1, k));
+  if (!announce) return;
+  if (k < 1) toast(`This image is already bigger than ${S.fitTarget} px, so it keeps its size`, 'info', true);
+  else if (k > 8) toast('8× is the most Texel can enlarge, so it stops there', 'info', true);
+}
 
 const look = () => ({ strength: S.aiStrength, detail: S.detail, sharpen: S.sharpen, smooth: S.smooth,
                       faces: S.restoreFaces ? S.faceStrength : 0, enhance: S.autoEnhance ? S.enhanceAmount : 0 });
@@ -46,9 +100,25 @@ function blocker() {
 const worker = new Worker(new URL('../engine/worker.js', import.meta.url), { type: 'module' });
 let runLook = null, blendLook = null, pendingBlend = false;
 let backend = '';
+// Every run and Auto Fix look gets an id, so an answer to one that was since closed or replaced is ignored.
+let jobSeq = 0, activeJob = 0;
 
 worker.onmessage = async (e) => {
   const m = e.data;
+  if (m.id != null && m.id !== activeJob) return;
+  if (batchJob) {   // a batch is running: its loop is waiting for the worker's answers
+    if (m.type === 'progress') {
+      S.stage = `${batchJob.prefix} · ${m.stage}`;
+      if (m.fraction != null) S.progress = (batchJob.n + m.fraction) / batchJob.count;
+      syncRun();
+    } else if (['result', 'plan', 'cancelled', 'error'].includes(m.type)) {
+      backend = m.backend || backend;
+      const answer = batchWait;
+      batchWait = null;
+      answer?.(m);
+    }
+    return;
+  }
   switch (m.type) {
     case 'progress':
       if (!S.isRunning) return;
@@ -57,6 +127,7 @@ worker.onmessage = async (e) => {
       break;
     case 'result': {
       backend = m.backend || backend;
+      if (!S.isRunning || !S.source) break;   // the image was closed while this was on its way
       const bitmap = await createImageBitmap(new ImageData(m.rgba, m.w, m.h));
       finishRun();
       const old = S.result?.bitmap;
@@ -83,7 +154,7 @@ worker.onmessage = async (e) => {
     case 'plan': {
       S.isAnalyzing = false;
       const p = m.plan;
-      Object.assign(S, { useAI: true, aiModel: p.model, scale: p.scale, aiStrength: p.aiStrength, detail: p.detail,
+      Object.assign(S, { useAI: true, aiModel: p.model, fitTarget: null, scale: p.scale, aiStrength: p.aiStrength, detail: p.detail,
                          smooth: p.smooth, sharpen: p.sharpen, restoreFaces: p.restoreFaces, faceStrength: p.faceStrength,
                          autoEnhance: p.autoEnhance, enhanceAmount: p.enhanceAmount, autoSummary: p.summary, tab: 'finish' });
       sync();
@@ -116,13 +187,18 @@ function run() {
   runLook = look();
   Object.assign(S, { isRunning: true, progress: 0, stage: 'Starting…', startedAt: performance.now() });
   sync();
-  worker.postMessage({ type: 'run', outW, outH, useAI: S.useAI, model: S.aiModel, preset: S.preset, look: runLook });
+  worker.postMessage({ type: 'run', id: (activeJob = ++jobSeq), outW, outH, useAI: S.useAI, model: S.aiModel, preset: S.preset, look: runLook });
 }
 function finishRun() { S.isRunning = false; S.stage = ''; }
-function cancel() { worker.postMessage({ type: 'cancel' }); S.stage = 'Cancelling…'; syncRun(); }
+function cancel() {
+  if (batchJob) batchJob.cancelled = true;
+  worker.postMessage({ type: 'cancel' });
+  S.stage = 'Cancelling…'; syncRun();
+}
 
 /** Re-composes the finishing sliders and Enhance on the last upscale, without running it again. */
 function applyDetail() {
+  saveSettingsSoon();
   if (!S.hasBase || S.isRunning) return;
   if (S.isBlending) { pendingBlend = true; return; }
   S.isBlending = true; blendLook = look();
@@ -133,7 +209,7 @@ function applyDetail() {
 function autoFix() {
   if (!S.source || S.isRunning || S.isAnalyzing) return;
   S.isAnalyzing = true; sync();
-  worker.postMessage({ type: 'autoPlan' });
+  worker.postMessage({ type: 'autoPlan', id: (activeJob = ++jobSeq) });
 }
 
 /** Wipes the result in from the right, settling the divider in the middle. */
@@ -152,29 +228,35 @@ let revealId = 0;
 
 // ---------------------------------------------------------------- opening images
 
+/** Decodes image file data into a bitmap (for showing) and straight RGBA pixels (for the engine). */
+async function decode(data) {
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(new Blob([data]), { imageOrientation: 'from-image', premultiplyAlpha: 'none' });
+  } catch {
+    throw new Error('That image couldn’t be read. Texel on Windows opens PNG, JPEG, WebP, AVIF, BMP and GIF files.');
+  }
+  const w = bitmap.width, h = bitmap.height;
+  if (w * h > 120_000_000) { bitmap.close?.(); throw new Error(`${w} × ${h} is too large to open.`); }
+  const c = new OffscreenCanvas(w, h);
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(bitmap, 0, 0);
+  const rgba = ctx.getImageData(0, 0, w, h).data;
+  let hasAlpha = false;
+  for (let i = 3; i < rgba.length; i += 4) if (rgba[i] < 255) { hasAlpha = true; break; }
+  return { bitmap, rgba, w, h, hasAlpha };
+}
+
 async function openData(name, data) {
-  if (S.isRunning) return;
+  if (S.isRunning || S.batch) return;
   S.isLoading = true; syncOverlays();
   try {
-    const blob = new Blob([data]);
-    let bitmap;
-    try {
-      bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image', premultiplyAlpha: 'none' });
-    } catch {
-      throw new Error('That image couldn’t be read. Texel on Windows opens PNG, JPEG, WebP, AVIF, BMP and GIF files.');
-    }
-    const w = bitmap.width, h = bitmap.height;
-    if (w * h > 120_000_000) throw new Error(`${w} × ${h} is too large to open.`);
-    const c = new OffscreenCanvas(w, h);
-    const ctx = c.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(bitmap, 0, 0);
-    const rgba = ctx.getImageData(0, 0, w, h).data;
-    let hasAlpha = false;
-    for (let i = 3; i < rgba.length; i += 4) if (rgba[i] < 255) { hasAlpha = true; break; }
+    const { bitmap, rgba, w, h, hasAlpha } = await decode(data);
     worker.postMessage({ type: 'setSource', src: { rgba, w, h, hasAlpha } }, [rgba.buffer]);
     S.source?.bitmap.close?.(); S.result?.bitmap.close?.();
     Object.assign(S, { source: { name, w, h, bitmap }, result: null, hasBase: false, lastDuration: null, resultLabel: '',
                        viewMode: 'split', split: 0.5, isSaved: false, autoSummary: null });
+    applyFit(false);
     view.split = 0.5; view.mode = 'split';
     showEditor();
     view.fitted = true;
@@ -192,26 +274,43 @@ async function openDialog() {
   if (f) openData(f.name, f.data);
 }
 
-async function pasteImage(items) {
-  for (const it of items) {
-    if (it.kind === 'file' && it.type.startsWith('image/')) { const f = it.getAsFile(); return openData('Pasted image.png', await f.arrayBuffer()); }
-  }
-  try {
-    const clip = await navigator.clipboard.read();
-    for (const c of clip) {
-      const t = c.types.find((x) => x.startsWith('image/'));
-      if (t) return openData('Pasted image.png', await (await c.getType(t)).arrayBuffer());
-    }
-  } catch { /* fall through */ }
+async function pasteImage(files = []) {
+  if (S.isRunning || S.batch) return;
+  const f = files.find((x) => x.type.startsWith('image/'));
+  if (f) return openData('Pasted image.png', await f.arrayBuffer());
+  const data = await window.texel.clipboardReadImage().catch(() => null);
+  if (data) return openData('Pasted image.png', data);
   toast('There’s no image on the clipboard', 'info', true);
+}
+
+/** Copies the result to the clipboard. */
+async function copyResult() {
+  if (!S.result || S.isRunning || S.isExporting) return;
+  S.isExporting = true; syncToolbar();
+  try {
+    const blob = await encode(S.result.bitmap, S.result.w, S.result.h, 'png');
+    if (await window.texel.clipboardWriteImage(await blob.arrayBuffer())) toast('Copied');
+    else toast('Couldn’t copy the image', 'info', true);
+  } catch (err) {
+    alertBox('Something went wrong', err.message);
+  } finally {
+    S.isExporting = false; syncToolbar();
+  }
 }
 
 function goHome() {
   if (S.isRunning) { worker.postMessage({ type: 'cancel' }); finishRun(); }
+  activeJob = 0;   // whatever the engine was doing for the old image no longer matters
+  if (batchJob) {   // let the batch loop unwind straight away; it must not touch the new state
+    batchJob.cancelled = true; batchJob.dead = true;
+    const answer = batchWait;
+    batchJob = null; batchWait = null;
+    answer?.({ type: 'cancelled' });
+  }
   revealId++;
   S.source?.bitmap.close?.(); S.result?.bitmap.close?.();
   Object.assign(S, { source: null, result: null, hasBase: false, isSaved: false, lastDuration: null, resultLabel: '',
-                     viewMode: 'split', split: 0.5, progress: 0, stage: '', autoSummary: null });
+                     viewMode: 'split', split: 0.5, progress: 0, stage: '', autoSummary: null, batch: null, isAnalyzing: false, isBlending: false });
   view.setImages(null, null);
   showHome();
   sync();
@@ -231,20 +330,24 @@ function requestExit(then = goHome) {
 
 // ---------------------------------------------------------------- saving
 
-const FORMATS = { png: ['image/png', 'png'], jpg: ['image/jpeg', 'jpg'], webp: ['image/webp', 'webp'] };
+/** Encodes a bitmap as a PNG, JPEG or WebP file. */
+async function encode(bitmap, w, h, fmt) {
+  const c = new OffscreenCanvas(w, h);
+  const ctx = c.getContext('2d');
+  if (fmt === 'jpg') { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); }
+  ctx.drawImage(bitmap, 0, 0);
+  return c.convertToBlob({ type: FORMATS[fmt][0], quality: fmt === 'png' ? undefined : 0.92 });
+}
+const sizeSuffix = (scale) => (scale === 1 ? 'enhanced' : `${+scale.toFixed(2)}x`);
 
 async function save(fmt = 'png', then) {
   if (!S.result || S.isRunning || S.isExporting) return;
   S.isExporting = true; syncToolbar();
   try {
     const { w, h, bitmap } = S.result;
-    const c = new OffscreenCanvas(w, h);
-    const ctx = c.getContext('2d');
-    if (fmt === 'jpg') { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); }
-    ctx.drawImage(bitmap, 0, 0);
-    const blob = await c.convertToBlob({ type: FORMATS[fmt][0], quality: fmt === 'png' ? undefined : 0.92 });
+    const blob = await encode(bitmap, w, h, fmt);
     const base = S.source.name.replace(/\.[^.]+$/, '');
-    const suffix = S.scale === 1 ? 'enhanced' : `${S.scale}x`;
+    const suffix = sizeSuffix(S.scale);
     const saved = await window.texel.saveImage(`${base}-texel-${suffix}.${FORMATS[fmt][1]}`, FORMATS[fmt][1], await blob.arrayBuffer());
     if (saved) { S.isSaved = true; toast(`Saved ${saved}`); then?.(); }
   } catch (err) {
@@ -252,6 +355,116 @@ async function save(fmt = 'png', then) {
   } finally {
     S.isExporting = false; sync();
   }
+}
+
+// ---------------------------------------------------------------- batch
+
+let batchJob = null;     // { n, count, prefix, cancelled, dead } while a batch runs
+let batchWait = null;    // resolves with the worker's next answer
+let batchSeq = 0;
+const CANCELLED = Symbol('cancelled');
+const workerAnswer = () => new Promise((resolve) => { batchWait = resolve; });
+const isImageFile = (f) => f.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|gif|avif|ico)$/i.test(f.name);
+
+/** Adds images to the batch (starting one if needed). Each is read only when its turn comes. */
+function addBatch(entries) {
+  if (S.isRunning || S.source || !entries.length) return;
+  const items = entries.map((e) => ({ id: ++batchSeq, name: e.name, read: e.read, status: 'waiting', note: '' }));
+  S.batch = (S.batch || []).concat(items);
+  showEditor();
+  sync();
+}
+async function addBatchFromDialog() {
+  if (S.isRunning || S.source) return;
+  const picked = await window.texel.pickImages();
+  addBatch(picked.map((p) => ({ name: p.name, read: () => window.texel.readPicked(p.id) })));
+}
+function addBatchFiles(files) {
+  addBatch(files.map((f) => ({ name: f.name, read: () => f.arrayBuffer() })));
+}
+
+/** A reason the batch can't start with the current settings, if there is one. */
+function batchBlocker() {
+  if (S.batchAuto) return null;
+  if (!S.useAI && S.scale === 1 && !S.fitTarget) return '1× (enhance without enlarging) needs AI mode.';
+  return null;
+}
+
+/** Upscales every image that isn't done yet, one after another, saving each into the batch folder. */
+async function runBatch() {
+  if (!S.batch || S.isRunning || batchBlocker()) return;
+  const todo = S.batch.filter((i) => i.status !== 'done');
+  if (!todo.length) return;
+  const base = { scale: S.scale, fit: S.fitTarget, useAI: S.useAI, model: S.aiModel, preset: S.preset,
+                 look: look(), auto: S.batchAuto, fmt: S.batchFormat };
+  const job = batchJob = { n: 0, count: todo.length, prefix: '', cancelled: false, dead: false };
+  Object.assign(S, { isRunning: true, progress: 0, stage: 'Starting…', startedAt: performance.now() });
+  sync();
+  let saved = 0;
+  for (let n = 0; n < todo.length && !job.cancelled; n++) {
+    const item = todo[n];
+    job.n = n; job.prefix = `${n + 1} of ${todo.length}`;
+    item.status = 'running'; item.note = '';
+    S.progress = n / todo.length; S.stage = `${job.prefix} · Opening`;
+    syncBatch(); syncRun();
+    try {
+      const data = await item.read();
+      if (job.cancelled) throw CANCELLED;
+      if (!data) throw new Error('This file couldn’t be read.');
+      const src = await decode(data);
+      src.bitmap.close?.();
+      if (job.cancelled) throw CANCELLED;
+      const srcW = src.w, srcH = src.h;
+      worker.postMessage({ type: 'setSource', src: { rgba: src.rgba, w: srcW, h: srcH, hasAlpha: src.hasAlpha } }, [src.rgba.buffer]);
+
+      // Settings for this image.
+      let s = base;
+      if (base.auto) {
+        S.stage = `${job.prefix} · Looking for what to fix`; syncRun();
+        worker.postMessage({ type: 'autoPlan', id: (activeJob = ++jobSeq) });
+        const m = await workerAnswer();
+        if (m.type === 'cancelled' || job.cancelled) throw CANCELLED;
+        if (m.type === 'error') throw new Error(friendlyError(m.message));
+        const p = m.plan;
+        s = { ...base, useAI: true, model: p.model, scale: p.scale,
+              look: { strength: p.aiStrength, detail: p.detail, sharpen: p.sharpen, smooth: p.smooth,
+                      faces: p.restoreFaces ? p.faceStrength : 0, enhance: p.autoEnhance ? p.enhanceAmount : 0 } };
+      }
+      let scale = s.scale;
+      if (base.fit) scale = Math.min(8, Math.max(1, base.fit / Math.max(srcW, srcH)));
+      const outW = Math.max(1, Math.round(srcW * scale)), outH = Math.max(1, Math.round(srcH * scale));
+      if (s.useAI) {
+        if (outW > MAX_SIDE || outH > MAX_SIDE || outW * outH > MAX_OUTPUT_PIXELS) throw new Error(`${outW} × ${outH} is too large. Pick a smaller size.`);
+      } else {
+        if (scale === 1) throw new Error('Already this size. Keeping the size needs AI mode.');
+        if (outW * outH > CLASSIC_MAX_PIXELS || outW > MAX_SIDE || outH > MAX_SIDE) throw new Error(`${outW} × ${outH} is too large. Pick a smaller size.`);
+      }
+      if (job.cancelled) throw CANCELLED;
+
+      // Upscale, then save.
+      worker.postMessage({ type: 'run', id: (activeJob = ++jobSeq), outW, outH, useAI: s.useAI, model: s.model, preset: s.preset, look: s.look });
+      const m = await workerAnswer();
+      if (m.type === 'cancelled' || job.cancelled) throw CANCELLED;
+      if (m.type === 'error') throw new Error(friendlyError(m.message));
+      S.stage = `${job.prefix} · Saving`; syncRun();
+      const bitmap = await createImageBitmap(new ImageData(m.rgba, m.w, m.h));
+      const blob = await encode(bitmap, m.w, m.h, base.fmt);
+      bitmap.close?.();
+      const stem = item.name.replace(/\.[^.]+$/, '');
+      const savedAs = await window.texel.writeBatchFile(`${stem}-texel-${sizeSuffix(scale)}.${FORMATS[base.fmt][1]}`, await blob.arrayBuffer());
+      item.status = 'done'; item.note = `${savedAs} · ${m.w} × ${m.h}`;
+      saved++;
+    } catch (err) {
+      if (err === CANCELLED) { item.status = 'waiting'; item.note = ''; break; }
+      item.status = 'failed'; item.note = err?.message || String(err);
+    }
+    if (!job.dead) syncBatch();
+  }
+  if (job.dead) return;   // the batch was closed while it ran
+  batchJob = null; batchWait = null;
+  finishRun(); S.progress = 0;
+  sync();
+  if (saved) toast(saved === 1 ? 'Saved 1 image' : `Saved ${saved} images`);
 }
 
 // ---------------------------------------------------------------- building the interface
@@ -269,17 +482,21 @@ $('btnAbout').innerHTML = icon('info');
 $('dropIcon').innerHTML = icon('image');
 $('btnOpen').innerHTML = `${icon('folder')}<span>Open an Image…</span>`;
 $('btnOpen').classList.add('shine');
-$('btnPaste').innerHTML = `${icon('paste')}<span>Paste from Clipboard</span>`;
+$('btnPaste').innerHTML = `${icon('paste')}<span>Paste</span>`;
+$('btnPaste').title = 'Paste an image from the clipboard (Ctrl+V)';
+$('btnBatch').innerHTML = `${icon('stack')}<span>Batch</span>`;
+$('btnBatch').title = 'Upscale several images at once (Ctrl+B)';
 $('features').innerHTML = [['cpu', 'On-device AI'], ['expand', 'Up to 8×'], ['lock', 'Private']]
   .map(([i, t], n) => `<span class="feature st" style="--i:${3 + n}">${icon(i)}${t}</span>`).join('');
 
 $('btnOpen').onclick = openDialog;
-$('btnPaste').onclick = () => pasteImage([]);
+$('btnPaste').onclick = () => pasteImage();
+$('btnBatch').onclick = addBatchFromDialog;
 $('btnAbout').onclick = showAbout;
 $('btnClose').onclick = () => requestExit();
 $('btnAdd').onclick = (e) => showMenu($('addMenu'), e.currentTarget, [
   { label: 'Open an Image…', icon: 'folder', kbd: 'Ctrl+O', act: () => requestExit(openDialog) },
-  { label: 'Paste from Clipboard', icon: 'paste', kbd: 'Ctrl+V', act: () => requestExit(() => pasteImage([])) },
+  { label: 'Paste from Clipboard', icon: 'paste', kbd: 'Ctrl+V', act: () => requestExit(() => pasteImage()) },
 ]);
 $('btnSave').onclick = () => save('png');
 $('btnSaveMenu').onclick = (e) => showMenu($('saveMenu'), e.currentTarget, [
@@ -287,6 +504,7 @@ $('btnSaveMenu').onclick = (e) => showMenu($('saveMenu'), e.currentTarget, [
   { label: 'PNG · lossless', act: () => save('png') },
   { label: 'JPEG', act: () => save('jpg') },
   { label: 'WebP · small', act: () => save('webp') },
+  { label: 'Copy Image', icon: 'copy', kbd: 'Ctrl+C', act: copyResult },
 ]);
 
 /** Segmented control with a sliding highlight. */
@@ -352,9 +570,21 @@ function buildPanel() {
     () => S.viewMode, (v) => { S.viewMode = v; view.setMode(v); }, true);
 
   P.auto = el('button', 'autofix');
-  P.auto.onclick = autoFix;
+  P.auto.onclick = () => { if (S.batch) { S.batchAuto = !S.batchAuto; sync(); } else autoFix(); };
 
-  P.size = pills([1, 2, 3, 4, 6, 8].map((v) => ({ value: v, title: `${v}×` })), () => S.scale, (v) => { S.scale = v; });
+  // No pill is lit while "Fit to" is choosing the size.
+  P.size = pills([1, 2, 3, 4, 6, 8].map((v) => ({ value: v, title: `${v}×` })),
+    () => (S.fitTarget ? -1 : S.scale), (v) => { S.fitTarget = null; S.scale = v; });
+  P.fit = el('button', 'fitbtn', icon('expand'));
+  P.fit.title = 'Fit to a size: 4K, custom…';
+  P.fit.setAttribute('aria-label', 'Fit to a size');
+  P.fit.onclick = (e) => showMenu($('fitMenu'), e.currentTarget, [
+    { section: 'Fit the long side to' },
+    ...FIT_CHOICES.map(([name, px]) => ({ label: `${name} · ${px} px`, icon: S.fitTarget === px ? 'tick' : null, act: () => fit(px) })),
+    { label: 'Custom Size…', act: askCustomSize },
+  ]);
+  const sizeWrap = el('div', 'size-wrap');
+  sizeWrap.append(P.size, P.fit);
   P.mode = pills([{ value: true, title: 'AI', icon: 'sparkles' }, { value: false, title: 'Classic', icon: 'cpu' }], () => S.useAI, (v) => { S.useAI = v; });
 
   P.chips = el('div', 'chips');
@@ -378,9 +608,68 @@ function buildPanel() {
 
   P.status = el('div', 'status');
   P.go = el('button', 'go shine');
-  P.go.onclick = run;
+  P.go.onclick = () => (S.batch ? runBatch() : run());
 
-  panel.append(P.view, P.auto, row('Size', P.size), row('Mode', P.mode), P.chips, P.tab, P.sliders, P.preset, P.enh, P.status, P.go);
+  P.modeRow = row('Mode', P.mode);
+  panel.append(P.view, P.auto, row('Size', sizeWrap), P.modeRow, P.chips, P.tab, P.sliders, P.preset, P.enh, P.status, P.go);
+}
+
+/** Common screen sizes for "Fit to" (name, long side in pixels). */
+const FIT_CHOICES = [['Full HD', 1920], ['2K', 2560], ['4K', 3840], ['5K', 5120], ['8K', 7680]];
+
+function askCustomSize() {
+  promptBox('Custom size', 'How many pixels should the longer side of the result be? Texel can enlarge up to 8×.',
+    'Long side in pixels', S.fitTarget ? String(S.fitTarget) : '', (text) => {
+      const px = parseInt(text.trim(), 10);
+      if (px >= 16) fit(Math.min(px, MAX_SIDE));
+    });
+}
+
+/** The batch list: built once, refreshed by syncBatch(). */
+const B = {};
+function buildBatch() {
+  const root = $('batch');
+  root.innerHTML = `
+    <div class="b-head"><div><h2>Batch</h2><small id="bSummary"></small></div><button class="b-add" id="bAdd">${icon('plus')}Add</button></div>
+    <div class="b-rows" id="bRows"></div>
+    <div class="b-dest">
+      <div class="line">${icon('folder')}<span id="bFolder"></span><button id="bShow">Show</button><button id="bChange">Change…</button></div>
+    </div>`;
+  B.format = pills([{ value: 'png', title: 'PNG' }, { value: 'jpg', title: 'JPEG' }, { value: 'webp', title: 'WebP' }],
+    () => S.batchFormat, (v) => { S.batchFormat = v; }, true);
+  root.querySelector('.b-dest').appendChild(B.format);
+  $('bAdd').onclick = addBatchFromDialog;
+  $('bShow').onclick = () => window.texel.showBatchFolder();
+  $('bChange').onclick = async () => { if (!S.isRunning) { S.batchFolder = await window.texel.chooseBatchFolder(); sync(); } };
+  $('bRows').onclick = (e) => {
+    const b = e.target.closest('button[data-remove]');
+    if (!b || S.isRunning) return;
+    S.batch = S.batch.filter((i) => i.id !== +b.dataset.remove);
+    sync();
+  };
+  window.texel.batchFolder().then((f) => { S.batchFolder = f; if (S.batch) syncBatch(); });
+}
+
+const STATUS_ICON = { waiting: 'circle', done: 'check', failed: 'warning' };
+const folderLabel = () => S.batchFolder.split(/[\\/]/).filter(Boolean).slice(-2).join(' › ');
+
+function syncBatch() {
+  const items = S.batch || [];
+  const done = items.filter((i) => i.status === 'done').length;
+  const total = items.length === 1 ? '1 image' : `${items.length} images`;
+  $('bSummary').textContent = done ? `${done} of ${total} done` : total;
+  $('bAdd').disabled = S.isRunning;
+  $('bChange').disabled = S.isRunning;
+  $('bFolder').textContent = `Saves to ${folderLabel()}`;
+  $('bFolder').title = S.batchFolder;
+  $('bRows').innerHTML = items.map((i) => `
+    <div class="b-row ${i.status}">
+      <span class="st-ic">${i.status === 'running' ? '<span class="spinner"></span>' : icon(STATUS_ICON[i.status])}</span>
+      <span class="t"><b>${esc(i.name)}</b><small title="${esc(i.note)}">${esc(i.note || (i.status === 'running' ? 'Working on it…' : 'Waiting'))}</small></span>
+      ${S.isRunning ? '' : `<button class="rm" data-remove="${i.id}" aria-label="Remove ${esc(i.name)}">${icon('x')}</button>`}
+    </div>`).join('') || '<p class="b-empty">Add some images to get going.</p>';
+  B.format.classList.toggle('dimmed', S.isRunning);
+  B.format.update();
 }
 
 function buildRunCard() {
@@ -402,21 +691,54 @@ function buildRunCard() {
   $('runHome').onclick = () => requestExit();
 }
 
+/** "12.4 s · about 40 s left": the estimate appears once there's enough progress to judge by. */
+function timeText(elapsed, progress) {
+  const clock = (t) => { const s = Math.round(t); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+  let text = elapsed < 60 ? `${elapsed.toFixed(1)} s` : clock(elapsed);
+  if (progress > 0.04 && progress < 0.995 && elapsed > 3) {
+    const left = elapsed / progress * (1 - progress);
+    const about = left < 10 ? `${Math.max(1, Math.ceil(left))} s`
+      : left < 60 ? `${Math.ceil(left / 5) * 5} s` : `${clock(Math.ceil(left / 15) * 15)} min`;
+    text += ` · about ${about} left`;
+  }
+  return text;
+}
+
 // ---------------------------------------------------------------- syncing the interface with the state
 
 function sync() {
+  saveSettingsSoon();
   syncToolbar(); syncOverlays(); syncInfo();
-  $('aurora').classList.toggle('dim', !!S.source);
-  if (!S.source) return;
+  const batch = !!S.batch;
+  $('aurora').classList.toggle('dim', !!S.source || batch);
+  if (!S.source && !batch) return;
+  // Batch mode: the list takes the place of the photo.
+  $('batch').hidden = !batch;
+  $('view').hidden = batch;
+  if (batch) {
+    $('knob').hidden = true; $('info').hidden = true;
+    $('tagBefore').hidden = $('tagAfter').hidden = true;
+    syncBatch();
+  }
   $('panel').hidden = S.isRunning;
   $('runcard').hidden = !S.isRunning;
-  $('scan').hidden = !S.isRunning;
+  $('scan').hidden = !S.isRunning || batch;
   if (S.isRunning) { syncRun(); return; }
 
-  P.view.hidden = !S.result;
-  const b = blocker();
-  P.auto.disabled = S.isAnalyzing || S.isRunning;
-  P.auto.innerHTML = `${icon('wand')}<span class="t"><b>Auto Fix</b><small>${S.isAnalyzing ? 'Looking for blur, noise, faces and lighting…' : 'Finds what’s wrong and fixes it, keeping the look'}</small></span>${S.isAnalyzing ? '<span class="spinner"></span>' : icon('arrowRight')}`;
+  P.view.hidden = !S.result || batch;
+  const b = batch ? batchBlocker() : blocker();
+  // While Auto Fix chooses the settings for each batch image, the manual ones are dimmed.
+  const autoOwns = batch && S.batchAuto;
+  for (const part of [P.size, P.modeRow, P.chips, P.tab, P.sliders, P.preset, P.enh]) part.classList.toggle('dimmed', autoOwns);
+  P.fit.classList.toggle('on', !!S.fitTarget);
+  P.auto.classList.toggle('toggle-on', autoOwns);
+  if (batch) {
+    P.auto.disabled = false;
+    P.auto.innerHTML = `${icon('wand')}<span class="t"><b>Auto Fix each image</b><small>${S.batchAuto ? 'On: Texel picks the settings for each one' : 'Off: every image gets the settings below'}</small></span>${icon(S.batchAuto ? 'check' : 'circle', 'state')}`;
+  } else {
+    P.auto.disabled = S.isAnalyzing || S.isRunning;
+    P.auto.innerHTML = `${icon('wand')}<span class="t"><b>Auto Fix</b><small>${S.isAnalyzing ? 'Looking for blur, noise, faces and lighting…' : 'Finds what’s wrong and fixes it, keeping the look'}</small></span>${S.isAnalyzing ? '<span class="spinner"></span>' : icon('arrowRight')}`;
+  }
   P.chips.hidden = !S.useAI;
   for (const c of P.chips.children) c.classList.toggle('on', c.dataset.model === S.aiModel);
   P.tab.setTitles([S.useAI ? 'Finish' : 'Quality', 'Enhance']);
@@ -428,6 +750,7 @@ function sync() {
 
   let status;
   if (b) status = `<div class="status warn">${icon('warning')}<span>${b}</span></div>`;
+  else if (autoOwns) status = '<div class="status">Auto Fix looks at each image and picks the model and sliders for it. It keeps the size, or doubles small images, unless you pick a Fit to size.</div>';
   else if (S.autoSummary && S.tab === 'finish') status = `<div class="status auto">${icon('wand')}<span>${S.autoSummary}</span></div>`;
   else if (S.scale === 1 && S.tab === 'finish') status = '<div class="status">1× keeps the size and rebuilds the image: the AI redraws it at 4× detail, then shrinks it back, removing blur, noise and compression.</div>';
   else if (S.tab === 'enhance') status = '<div class="status">Faces redraws blurry faces with a face AI. Colour fixes light and colour and adds clarity to texture like trees and fabric.</div>';
@@ -436,10 +759,22 @@ function sync() {
   P.status = $('panel').querySelector('.status');
 
   const size = outputSize();
-  P.go.disabled = S.isRunning || !!b;
+  let title, sub;
+  if (batch) {
+    const left = S.batch.filter((i) => i.status !== 'done').length;
+    P.go.disabled = S.isRunning || !left || !!b;
+    title = !S.batch.length ? 'Add images to start' : !left ? 'All done' : left === 1 ? 'Upscale 1 Image' : `Upscale ${left} Images`;
+    const sizing = S.fitTarget ? `Long side → ${S.fitTarget} px` : S.batchAuto ? 'Size picked per image'
+      : S.scale === 1 ? 'Same size' : `${scaleText(S.scale)} each`;
+    sub = `${sizing} · ${{ png: 'PNG', jpg: 'JPEG', webp: 'WebP' }[S.batchFormat]} → ${esc(S.batchFolder.split(/[\\/]/).filter(Boolean).pop() || '')}`;
+  } else {
+    P.go.disabled = S.isRunning || !!b;
+    title = S.scale === 1 ? 'Enhance with AI' : S.useAI ? 'Upscale with AI' : 'Upscale';
+    sub = !size ? '' : S.scale === 1 ? `Same size · ${size[0].toLocaleString()} × ${size[1].toLocaleString()} px`
+      : `→ ${size[0].toLocaleString()} × ${size[1].toLocaleString()} px`;
+  }
   P.go.classList.toggle('off', P.go.disabled);
-  P.go.innerHTML = `${icon('sparkles')}<span class="t"><b>${S.scale === 1 ? 'Enhance with AI' : S.useAI ? 'Upscale with AI' : 'Upscale'}</b>
-    <small>${size ? (S.scale === 1 ? `Same size · ${size[0].toLocaleString()} × ${size[1].toLocaleString()} px` : `→ ${size[0].toLocaleString()} × ${size[1].toLocaleString()} px`) : ''}</small></span>${icon('arrowRight')}`;
+  P.go.innerHTML = `${icon('sparkles')}<span class="t"><b>${title}</b><small>${sub}</small></span>${icon('arrowRight')}`;
   P.go.title = 'Ctrl+Enter';
 }
 
@@ -449,14 +784,16 @@ function syncRun() {
   const p = Math.max(0.02, S.progress);
   $('ringArc').style.strokeDashoffset = 179.07 * (1 - p);
   $('runPct').textContent = `${Math.round(S.progress * 100)}%`;
-  $('runTitle').textContent = S.useAI ? (S.scale === 1 ? 'Enhancing with AI' : 'Upscaling with AI') : 'Upscaling';
+  $('runTitle').textContent = S.batch ? 'Upscaling the batch'
+    : S.useAI ? (S.scale === 1 ? 'Enhancing with AI' : 'Upscaling with AI') : 'Upscaling';
   $('runStage').textContent = S.stage;
 }
-setInterval(() => { if (S.isRunning) $('runTime').textContent = `${((performance.now() - S.startedAt) / 1000).toFixed(1)} s`; }, 100);
+setInterval(() => { if (S.isRunning) $('runTime').textContent = timeText((performance.now() - S.startedAt) / 1000, S.progress); }, 100);
 
 function syncToolbar() {
-  const has = !!S.source;
-  $('btnClose').hidden = !has; $('tbGroup').hidden = !has; $('tbTitle').hidden = !has;
+  const has = !!S.source || !!S.batch;
+  $('btnClose').hidden = !has; $('tbGroup').hidden = !S.source; $('tbTitle').hidden = !has;
+  $('btnClose').title = S.batch ? 'Close batch (Esc)' : 'Close image (Esc)';
   $('btnAdd').disabled = S.isRunning;
   const canSave = !!S.result && !S.isRunning && !S.isExporting;
   $('btnSave').disabled = !canSave; $('btnSaveMenu').disabled = !canSave;
@@ -514,7 +851,7 @@ function showMenu(menu, anchor, items) {
   menu.style.left = `${Math.min(window.innerWidth - menu.offsetWidth - 10, r.right - menu.offsetWidth + 20)}px`;
 }
 document.addEventListener('pointerdown', (e) => {
-  for (const m of [$('saveMenu'), $('addMenu')]) if (!m.hidden && !m.contains(e.target)) m.hidden = true;
+  for (const m of [$('saveMenu'), $('addMenu'), $('fitMenu')]) if (!m.hidden && !m.contains(e.target)) m.hidden = true;
 }, true);
 
 function confirmBox(title, text, actions) {
@@ -531,13 +868,28 @@ function confirmBox(title, text, actions) {
 }
 function alertBox(title, text) { confirmBox(title, text, [{ label: 'OK', cls: 'primary' }]); }
 
+/** A dialog with one text field. `onOk` gets what was typed. */
+function promptBox(title, text, placeholder, initial, onOk) {
+  const d = $('dialog');
+  d.className = 'dialog glass';
+  d.innerHTML = `<h2>${title}</h2><p>${text}</p><input type="text" inputmode="numeric" spellcheck="false"><div class="actions"><button class="primary">Set</button><button>Cancel</button></div>`;
+  const input = d.querySelector('input'), [ok, no] = d.querySelectorAll('.actions button');
+  input.placeholder = placeholder; input.value = initial;
+  const close = () => { $('modal').hidden = true; };
+  ok.onclick = () => { close(); onOk(input.value); };
+  no.onclick = close;
+  input.onkeydown = (e) => { if (e.key === 'Enter') ok.click(); };
+  $('modal').hidden = false;
+  input.focus(); input.select();
+}
+
 async function showAbout() {
   const info = await window.texel.appInfo();
   const esrgan = await window.texel.readText('licenses/LICENSE-Real-ESRGAN.txt');
   const d = $('dialog');
   d.className = 'dialog glass about';
   d.innerHTML = `
-    <div class="about-head"><img src="img/logo.png" alt=""><div class="t"><b>Texel</b><small>Version ${info.version} · Windows</small></div><button id="aboutDone">Done</button></div>
+    <div class="about-head"><img src="img/logo.png" alt=""><div class="t"><b>Texel</b><small>Version ${info.version.replace(/\.0$/, "")} · Windows</small></div><button id="aboutDone">Done</button></div>
     <h3>Privacy</h3><p>Texel upscales your images entirely on this PC. It doesn’t collect, upload or share any data, and has no accounts, ads or tracking.</p>
     <h3>How it works</h3><p>AI mode uses Real-ESRGAN neural networks running on your graphics card through WebGPU (or the processor if the graphics card can’t). Enhance redraws faces with GFPGAN and fixes colour and light automatically. Classic mode uses GPU shaders: edge-directed upscaling (AMD FidelityFX Super Resolution 1), detail refinement and contrast-adaptive sharpening.${backend ? ` This PC is using the ${backend === 'GPU' ? 'graphics card' : 'processor'}.` : ''}</p>
     <h3>Acknowledgements</h3>
@@ -558,20 +910,26 @@ document.addEventListener('keydown', (e) => {
     return;
   }
   const k = e.key.toLowerCase();
-  if (e.ctrlKey && k === 'o') { e.preventDefault(); S.source ? requestExit(openDialog) : openDialog(); }
+  const openMenu = [$('saveMenu'), $('addMenu'), $('fitMenu')].find((m) => !m.hidden);
+  if (e.key === 'Escape' && openMenu) { openMenu.hidden = true; return; }   // Esc closes a menu first
+  if (e.ctrlKey && k === 'o') { e.preventDefault(); S.batch ? addBatchFromDialog() : S.source ? requestExit(openDialog) : openDialog(); }
+  else if (e.ctrlKey && k === 'b' && !S.source) { e.preventDefault(); addBatchFromDialog(); }
   else if (e.ctrlKey && k === 's') { e.preventDefault(); save('png'); }
-  else if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); run(); }
+  else if (e.ctrlKey && !e.shiftKey && k === 'c' && S.result && !String(getSelection())) { e.preventDefault(); copyResult(); }
+  else if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); S.batch ? runBatch() : run(); }
   else if (e.ctrlKey && e.shiftKey && k === 'a') { e.preventDefault(); autoFix(); }
   else if (e.ctrlKey && (k === '=' || k === '+')) { e.preventDefault(); view.zoomBy(1.25); }
   else if (e.ctrlKey && k === '-') { e.preventDefault(); view.zoomBy(0.8); }
   else if (e.ctrlKey && k === '0') { e.preventDefault(); view.fit(); }
   else if (e.ctrlKey && k === '1') { e.preventDefault(); view.actualPixels(); }
-  else if (e.key === 'Escape' && S.source) requestExit();
+  else if (e.key === 'Escape' && (S.source || S.batch)) requestExit();
 });
 document.addEventListener('paste', (e) => {
-  if (S.isRunning) return;
-  const items = [...(e.clipboardData?.items || [])];
-  if (items.some((i) => i.type.startsWith('image/'))) { e.preventDefault(); S.source ? requestExit(() => pasteImage(items)) : pasteImage(items); }
+  if (S.isRunning || S.batch || !$('modal').hidden) return;
+  e.preventDefault();
+  // Take the image out of the event now: its data isn't readable later.
+  const files = [...(e.clipboardData?.files || [])];
+  S.source ? requestExit(() => pasteImage(files)) : pasteImage(files);
 });
 
 let dragDepth = 0;
@@ -580,16 +938,20 @@ window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth =
 window.addEventListener('dragover', (e) => e.preventDefault());
 window.addEventListener('drop', async (e) => {
   e.preventDefault(); dragDepth = 0; $('drop').hidden = true;
-  const f = [...(e.dataTransfer?.files || [])][0];
-  if (!f || S.isRunning) return;
+  const files = [...(e.dataTransfer?.files || [])].filter(isImageFile);
+  if (!files.length || S.isRunning) return;
+  // Several images dropped at once (or anything dropped on the batch list) make a batch.
+  if (S.batch || (files.length > 1 && !S.source)) return addBatchFiles(files);
+  const f = files[0];
   const data = await f.arrayBuffer();
   S.source ? requestExit(() => openData(f.name, data)) : openData(f.name, data);
 });
 
 window.texel.onCloseRequested(() => requestExit(() => window.texel.confirmClose()));
-window.addEventListener('resize', () => { if (S.source && !S.isRunning) for (const p of [P.view, P.size, P.mode, P.tab, P.preset]) p.update(); });
+window.addEventListener('resize', () => { if (S.source && !S.isRunning) for (const p of [P.view, P.size, P.mode, P.tab, P.preset]) p.update(); if (S.batch) B.format.update(); });
 
 buildPanel();
+buildBatch();
 buildRunCard();
 sync();
 document.fonts.ready.then(() => sync());

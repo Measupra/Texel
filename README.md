@@ -31,7 +31,7 @@ Needs **macOS 14 Sonoma or later**. Works on Apple Silicon and Intel Macs.
 
 ### Windows
 
-1. Download **Texel-Windows-1.0.0.zip** from the [latest release](https://github.com/Measupra/Texel/releases/latest).
+1. Download **Texel-Windows-0.2.zip** from the [latest release](https://github.com/Measupra/Texel/releases/latest).
 2. Right-click it, choose **Extract All…**, and open the folder.
 3. Double-click **Texel.exe**.
 
@@ -45,16 +45,22 @@ Texel also runs on iPhone and iPad, but there's no download for it yet: it has t
 
 ## How to use
 
-1. Open an image, drag one onto the window, or paste one.
+1. Open an image, drag one onto the window, or paste one from the clipboard.
 2. Click **Auto Fix**: Texel looks at the photo, works out what's wrong with it and picks the best settings for you.
 
    Or choose them yourself:
-   - **Size:** **1×** keeps the size and just makes the image cleaner and sharper; **2× to 8×** enlarge it.
+   - **Size:** **1×** keeps the size and just makes the image cleaner and sharper; **2× to 8×** enlarge it. The button next to the sizes fits the result to an exact size instead, such as **4K** or any number of pixels you type.
    - **Mode:** **AI** for the best results (**Photo**, **General** for speed, or **Anime** for drawings), or **Classic** for fast upscaling without AI.
 3. Click **Upscale**.
 4. Drag the divider to compare before and after. Scroll to zoom in.
 5. Fine-tune the result. The sliders update instantly, without running the AI again.
-6. Save it as PNG, JPEG, HEIC (Mac) or WebP (Windows).
+6. Save it as PNG, JPEG, HEIC (Mac) or WebP (Windows), or copy it to paste into another app.
+
+### Many images at once
+
+1. Click **Batch** on the start screen and choose your images, or drag several onto the window together.
+2. Pick the settings as usual, or turn on **Auto Fix each image** to let Texel choose for every image separately.
+3. Click **Upscale**. Texel works through the list and saves each result into a **Texel** folder inside **Downloads** (you can change the folder). On iPhone and iPad they go to Photos.
 
 ## Features
 
@@ -67,6 +73,10 @@ Texel also runs on iPhone and iPad, but there's no download for it yet: it has t
   - **Detail** adds back the original's fine texture.
   - **Smooth** evens out noise and blockiness.
   - **Sharp** sharpens edges.
+- **Batch** upscales a whole set of images in one go and saves them for you.
+- **Fit to a size:** aim for Full HD, 4K, 8K or a custom size instead of a plain 2× or 4×.
+- **Copy and paste:** paste an image straight in, and copy the result straight out.
+- **Remembers your settings** between launches, and shows how much time is left while it works.
 - **Pixelated images** are spotted and rebuilt from their real resolution instead of being enlarged block by block.
 - **Classic mode** offers fast GPU upscaling without AI (AMD FidelityFX Super Resolution 1, detail refinement and sharpening).
 - **Before/after compare** with a draggable divider, zoom and pan.

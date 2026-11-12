@@ -27,6 +27,10 @@ const P = {
   leftRight: '<path d="M4 12h16M8 8l-4 4 4 4M16 8l4 4-4 4"/>',
   warning: '<path d="M12 3l10 18H2z" fill="currentColor" stroke="none"/><path d="M12 10v5" stroke="#0b0d18"/><circle cx="12" cy="18" r=".9" fill="#0b0d18" stroke="none"/>',
   image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="M21 16l-5-5-9 9"/>',
+  circle: '<circle cx="12" cy="12" r="8.5"/>',
+  tick: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  stack: '<rect x="3" y="8" width="14" height="12" rx="2"/><path d="M7 4.5h11.5A2.5 2.5 0 0121 7v9.5"/>',
+  copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 00-2-2H6a2 2 0 00-2 2v8a2 2 0 002 2h2"/>',
 };
 
 export function icon(name, cls = '') {

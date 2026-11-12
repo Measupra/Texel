@@ -19,7 +19,10 @@ let backend = null;        // 'GPU' or 'CPU'
 let src = null;            // { rgba, w, h, hasAlpha }
 let base = null;           // { rgba, w, h, detail: {rgba,w,h}, useFinisher }
 let faces = null;          // restored faces for `base` (null = not worked out yet)
-let cancelFlag = false;
+// Jobs run one at a time, in the order they arrive. Each run carries an id; Cancel stops every run
+// asked for so far (the one in progress and any still queued), but not ones that arrive later.
+let currentRun = 0, lastRunSeen = 0, cancelUpTo = 0;
+const isCancelled = () => currentRun <= cancelUpTo;
 
 async function gpuAvailable() {
   try {
@@ -69,10 +72,10 @@ async function compose(look) {
   return img === base.rgba ? new Uint8ClampedArray(img) : img;
 }
 
-async function workOutFaces(progress) {
+async function workOutFaces(progress, cancelled) {
   try {
     faces = await restoreFaces(base.detail.rgba, base.detail.w, base.detail.h, await detector(),
-                               await restorer(progress), progress, () => cancelFlag);
+                               await restorer(progress), progress, cancelled);
   } catch (e) {
     if (e.message === 'cancelled') throw e;
     console.warn('Faces skipped:', e);
@@ -83,53 +86,69 @@ async function workOutFaces(progress) {
 const handlers = {
   setSource(m) { src = m.src; base = null; faces = null; },
 
+  // A run that's cancelled or fails leaves the last finished result in place for the sliders.
   async run(m) {
-    cancelFlag = false;
+    const kept = { base, faces };
+    try { await handlers.upscale(m); } catch (e) { ({ base, faces } = kept); throw e; }
+  },
+
+  async upscale(m) {
+    currentRun = m.id;
     const started = performance.now();
-    const progress = (stage, fraction) => postMessage({ type: 'progress', stage, fraction });
+    const progress = (stage, fraction) => postMessage({ type: 'progress', id: m.id, stage, fraction });
+    const stopIfCancelled = () => { if (isCancelled()) throw new Error('cancelled'); };
+    stopIfCancelled();
     let rebuiltFrom = 1;
     if (m.useAI) {
       const s = await session(MODELS[m.model].file, (t) => progress(t, 0));
-      const r = await upscale(src, m.outW, m.outH, runner(s, 'image', 'upscaled', [1, 3, 256, 256]), progress, () => cancelFlag);
+      const r = await upscale(src, m.outW, m.outH, runner(s, 'image', 'upscaled', [1, 3, 256, 256]), progress, isCancelled);
       rebuiltFrom = r.rebuiltFrom;
       base = { rgba: r.rgba, w: r.w, h: r.h, detail: r.detail, useFinisher: true };
     } else {
-      const rgba = await classicUpscale(src, m.outW, m.outH, m.preset, progress, () => cancelFlag);
+      const rgba = await classicUpscale(src, m.outW, m.outH, m.preset, progress, isCancelled);
       if (src.hasAlpha) resizeAlphaInto(src.rgba, src.w, src.h, rgba, m.outW, m.outH);
       base = { rgba, w: m.outW, h: m.outH, detail: { rgba: src.rgba, w: src.w, h: src.h }, useFinisher: false };
     }
     faces = null;
-    if (m.look.faces > 0.001) await workOutFaces((t) => progress(t, 0.985));
+    // Cancel pressed late (after the last tile) still stops the run rather than showing a result.
+    stopIfCancelled();
+    if (m.look.faces > 0.001) await workOutFaces((t) => progress(t, 0.985), isCancelled);
+    stopIfCancelled();
     progress('Finishing touches', 0.99);
     const rgba = await compose(m.look);
-    postMessage({ type: 'result', rgba, w: base.w, h: base.h, rebuiltFrom, faceCount: faces?.length ?? 0,
+    stopIfCancelled();
+    postMessage({ type: 'result', id: m.id, rgba, w: base.w, h: base.h, rebuiltFrom, faceCount: faces?.length ?? 0,
                   took: (performance.now() - started) / 1000, backend }, [rgba.buffer]);
   },
 
   async compose(m) {
     if (!base) return;
     const needFaces = m.look.faces > 0.001 && faces === null;
-    if (needFaces) await workOutFaces(() => {});
+    if (needFaces) await workOutFaces(() => {}, () => false);
     const rgba = await compose(m.look);
     postMessage({ type: 'composed', rgba, w: base.w, h: base.h, newFaces: needFaces ? faces.length : -1 }, [rgba.buffer]);
   },
 
-  async autoPlan() {
+  async autoPlan(m) {
     const found = await findFaces(src.rgba, src.w, src.h, await detector());
     const report = await analyze(src.rgba, src.w, src.h, found);
-    postMessage({ type: 'plan', plan: plan(report, src.w, src.h) });
+    postMessage({ type: 'plan', id: m.id, plan: plan(report, src.w, src.h) });
   },
 
-  cancel() { cancelFlag = true; },
 };
 
-self.onmessage = async (e) => {
+let queue = Promise.resolve();
+self.onmessage = (e) => {
   const m = e.data;
-  try {
-    await handlers[m.type](m);
-  } catch (err) {
-    const msg = String(err?.message || err);
-    postMessage({ type: msg === 'cancelled' ? 'cancelled' : 'error', job: m.type, message: msg });
-  }
+  if (m.type === 'cancel') { cancelUpTo = lastRunSeen; return; }   // acts at once, not in turn
+  if (m.type === 'run') lastRunSeen = m.id;
+  queue = queue.then(async () => {
+    try {
+      await handlers[m.type](m);
+    } catch (err) {
+      const msg = String(err?.message || err);
+      postMessage({ type: msg === 'cancelled' ? 'cancelled' : 'error', id: m.id, job: m.type, message: msg });
+    }
+  });
 };
 postMessage({ type: 'ready' });
